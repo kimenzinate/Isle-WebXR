@@ -1,0 +1,51 @@
+:root {
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: white;
+  background: #8ebee8;
+}
+* { box-sizing: border-box; }
+html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+body { background: radial-gradient(circle at 50% 20%, #d8edff 0%, #91bfe8 55%, #6b9dca 100%); }
+#scene { width: 100%; height: 100%; display: block; touch-action: none; }
+#hud { display: none; }
+.brand { display:none; }
+#status { display:none; }
+.help { display:none; }
+.loading-card {
+  position: fixed;
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  z-index: 5;
+  min-width: 270px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 18px 20px;
+  border-radius: 18px;
+  color: #203347;
+  background: rgba(255,255,255,.78);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 18px 70px rgba(27, 65, 98, .18);
+  transition: opacity .35s ease, transform .35s ease;
+}
+.loading-card span { font-size: 12px; opacity: .68; }
+.loading-card.hidden { opacity: 0; transform: translate(-50%, -45%); pointer-events: none; }
+#VRButton {
+  border: 0 !important;
+  left: auto !important;
+  right: 18px !important;
+  bottom: 18px !important;
+  width: auto !important;
+  min-width: 132px !important;
+  height: 44px !important;
+  padding: 0 18px !important;
+  border-radius: 999px !important;
+  background: rgba(14, 31, 49, .78) !important;
+  backdrop-filter: blur(12px);
+  font: 700 13px/44px Inter, ui-sans-serif, -apple-system, sans-serif !important;
+  opacity: 1 !important;
+}
+@media (max-width: 650px) {
+  #hud { left: 12px; top: 12px; }
+  .help { display: none; }
+}

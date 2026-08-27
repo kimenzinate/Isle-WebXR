@@ -1,0 +1,1689 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { USDLoader } from 'three/addons/loaders/USDLoader.js';
+
+const canvas = document.querySelector('#scene');
+const statusEl = document.querySelector('#status');
+const loadingEl = document.querySelector('#loading');
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+renderer.xr.enabled = true;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x92bde5);
+const camera = new THREE.PerspectiveCamera(58, window.innerWidth / window.innerHeight, 0.01, 100);
+camera.position.set(0, 0, 0.0);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, -1.10);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.minDistance = 0.55;
+controls.maxDistance = 4.2;
+controls.maxPolarAngle = Math.PI * 0.82;
+// Keep the desktop prototype perfectly front-facing. Only individual island models tilt.
+controls.enableRotate = false;
+controls.enablePan = false;
+controls.enableZoom = false;
+controls.update();
+
+const sessionInit = { optionalFeatures: ['local-floor', 'hand-tracking'] };
+const vrButton = VRButton.createButton(renderer, sessionInit);
+document.body.appendChild(vrButton);
+if (navigator.xr?.isSessionSupported) {
+  navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
+    if (!supported) vrButton.style.display = 'none';
+  }).catch(() => { vrButton.style.display = 'none'; });
+} else {
+  vrButton.style.display = 'none';
+}
+
+const worldRoot = new THREE.Group();
+const stageRoot = new THREE.Group();
+// Desktop/web uses a centred head-relative coordinate system: camera Y=0.
+// Existing scene coordinates were authored around 1.60m eye height, so only the
+// stage root is translated for desktop. This is a translation, not a rotation.
+const DESKTOP_STAGE_Y_OFFSET = -1.60;
+stageRoot.position.y = DESKTOP_STAGE_Y_OFFSET;
+scene.add(worldRoot, stageRoot);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8aa4bd, 2.1));
+const keyLight = new THREE.DirectionalLight(0xffffff, 2.2);
+keyLight.position.set(-2.5, 4.2, 2.4);
+scene.add(keyLight);
+const fillLight = new THREE.DirectionalLight(0xffe9cf, 1.3);
+fillLight.position.set(3, 2.2, 1);
+scene.add(fillLight);
+
+const textureLoader = new THREE.TextureLoader();
+const usdLoader = new USDLoader();
+const clock = new THREE.Clock();
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+const interactables = [];
+const animated = [];
+
+// Stage intro captions follow the Swift Memory Catch timing: hold 2.2s, fade 0.4s.
+let heavenIntroUntil = 0;
+let voiceIntroUntil = 0;
+const INTRO_HOLD_MS = 2200;
+const INTRO_FADE_MS = 400;
+const activeMedia = new Set();
+const cachedTextures = new Map();
+const cachedUiImages = new Map();
+let islandModel = null;
+let jungfrauModel = null;
+let currentStage = 'tutorial';
+let stageBeforeExit = 'heaven';
+let tutorialIndex = 0;
+let selectedMemory = null;
+let selectedVoice = null;
+let reflectionComfort = null;
+let reflectionFeeling = null;
+let randomMode = false;
+let randomMemories = [];
+let tutorialTimer = null;
+
+const FONT_SERIF = '"Playfair Display", Georgia, serif';
+const FONT_SANS = '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Arial, sans-serif';
+const TUTORIAL_FRAME_PX = { width: 1920, height: 1080 };
+const TUTORIAL_FRAME_M = { width: 1.64, height: 0.9225 };
+const TUTORIAL_SCALE = 1.00; // Figma-based panel drawing, with overall world size reduced to match reference
+const TUTORIAL_CENTER = [0, 1.60, -1.08]; // restore popup to the visual centre while keeping room for the floating Back button
+const tutorialAssets = new Map();
+
+// Fixed floating controls: visual scale follows the original Swift/Figma control.
+// Icon 30, text ~28, gap 12, padding 20. The world-space scale is calibrated
+// for the original head-relative z ~= -0.92 so the controls stay legible.
+const CONTROL_M_PER_PX = 0.00078;
+const CONTROL_ICON_PX = 24;
+const CONTROL_FONT_PX = 24;
+const CONTROL_GAP_PX = 10;
+const CONTROL_PAD_X_PX = 18;
+const CONTROL_PAD_Y_PX = 18;
+const CONTROL_RADIUS_PX = 18;
+const HOME_Y_OFFSET = 0.13;
+
+const MEMORY = [
+  {
+    id: 1, title: 'Our Boracay Holiday', type: 'photo', asset: './assets/images/boracay.jpg',
+    description: 'We sailed on a yacht, discovered delicious food and spent time on Boracay’s beautiful white-sand beaches. Every day felt special, and I would love for us to return together one day.'
+  },
+  {
+    id: 2, title: 'Recent Family Photo', type: 'photo', asset: './assets/images/family.jpg',
+    description: 'We took this photo at a café shortly before I moved to the UK. Dad later had fun decorating it with AI, which somehow made the memory even more endearing.'
+  },
+  {
+    id: 3, title: 'Childhood Island Trip', type: 'photo', asset: './assets/images/childhood.jpg',
+    description: 'I made this photo diary in primary school after taking time away for a family experience trip. My parents look so young, and our little family looks wonderfully sweet together.'
+  },
+  {
+    id: 4, title: 'Paris with Mum', type: 'video', asset: './assets/video/paris.mp4',
+    description: 'Mum and I spent part of the summer together in Paris. It was incredibly hot, but seeing how much she enjoyed the trip made me so happy. We only recently said goodbye, but I already miss her.'
+  },
+  {
+    id: 6, title: 'Jungfrau Keyring', type: 'object', asset: './assets/models/jungfrau.usdz',
+    description: 'Mum and I travelled to Grindelwald and made our way up to Jungfraujoch. Seeing snow in the middle of summer made the trip feel especially magical.'
+  },
+  {
+    id: 5, title: 'A Portrait of Mum and Dad', type: 'video', asset: './assets/video/parents.mp4',
+    description: 'After I started working, I treated Mum and Dad to a professional studio portrait session. It still amazes me how affectionate they are after all these years.'
+  }
+];
+
+const VOICES = [
+  { id: 2, title: 'Mum Singing\nin the Car', asset: './assets/audio/song.m4a', orbPx: 196, titlePx: 31, description: 'Mum used to sing this song in the car. She’s not exactly in tune, but she loves singing — and hearing it always makes me smile.' },
+  { id: 1, title: 'A Call with Dad', asset: './assets/audio/dad.m4a', orbPx: 248, titlePx: 34, description: 'When I was working far from home, Dad reminded me to eat properly and look after my health. Hearing his voice gave me strength.' },
+  { id: 4, title: 'Dad’s Promise\nto Mum', asset: './assets/audio/promise.m4a', orbPx: 130, titlePx: 22, description: 'Dad made this promise to Mum, and he actually kept it. Hearing it again makes me happy, knowing that he meant what he said.' },
+  { id: 5, title: 'Mum Singing\nHappy Birthday', asset: './assets/audio/birthday.mp3', orbPx: 141, titlePx: 26, description: 'Mum sang Happy Birthday to Dad while I was living far away. Next year, I want to celebrate his birthday with them in person.' },
+  { id: 3, title: 'Mum’s Scary\nStory', asset: './assets/audio/story.m4a', orbPx: 257, titlePx: 38, description: 'Mum told me a scary story so dramatically and hilariously that we ended up laughing the whole time.' }
+];
+
+const TUTORIAL_STEPS = [
+  'intro',
+  'islandName',
+  'welcome',
+  'gestures',
+  'catchMemory',
+  'comfortThings',
+  'customiseIsland',
+  'portal'
+];
+
+const MEMORY_LAYOUT = {
+  // Rebalanced from Swift/Figma for WebXR readability:
+  // smaller islands, more breathing room, slightly farther depth.
+  1: { // Boracay — left-middle
+    position: [-0.67, 1.50, -1.22],
+    islandSize: 0.34,
+    cardW: 0.205,
+    cardH: 0.154,
+    cardY: 0.106,
+    yaw: 0.08
+  },
+  2: { // Recent Family — hero, upper-centre
+    position: [0.01, 1.78, -1.24],
+    islandSize: 0.42,
+    cardW: 0.295,
+    cardH: 0.221,
+    cardY: 0.132,
+    yaw: -0.04
+  },
+  3: { // Childhood — small, lower-left
+    position: [-0.39, 1.17, -1.18],
+    islandSize: 0.21,
+    cardW: 0.124,
+    cardH: 0.093,
+    cardY: 0.060,
+    yaw: -0.08
+  },
+  4: { // Paris — second-largest, lower-right
+    position: [0.55, 1.22, -1.22],
+    islandSize: 0.39,
+    cardW: 0.228,
+    cardH: 0.172,
+    cardY: 0.114,
+    yaw: 0.07
+  },
+  5: { // Parents portrait — smallest, upper-right
+    position: [0.69, 1.62, -1.24],
+    islandSize: 0.20,
+    cardW: 0.097,
+    cardH: 0.073,
+    cardY: 0.052,
+    yaw: 0.10
+  },
+  6: { // Jungfrau object — quiet secondary, centre-lower
+    position: [0.02, 1.39, -1.24],
+    islandSize: 0.19,
+    objectSize: 0.108,
+    cardY: 0.058,
+    yaw: 0.00
+  }
+};
+
+const NOTE_LAYOUT = [
+  // Same dispersed composition, but reduced note sizes so the memories breathe more.
+  { position: [-0.225, 1.415, -1.00], width: 0.135, height: 0.090, amp: 0.010, speed: 0.31, rotation:  0.035 },
+  { position: [-0.365, 1.825, -1.03], width: 0.255, height: 0.170, amp: 0.014, speed: 0.29, rotation: -0.045 },
+  { position: [-0.690, 1.280, -1.02], width: 0.190, height: 0.127, amp: 0.011, speed: 0.30, rotation:  0.055 },
+  { position: [ 0.470, 1.825, -1.05], width: 0.185, height: 0.123, amp: 0.012, speed: 0.28, rotation: -0.035 },
+  { position: [ 0.330, 1.555, -1.03], width: 0.155, height: 0.104, amp: 0.010, speed: 0.295, rotation: 0.045 },
+  { position: [ 0.740, 1.405, -1.04], width: 0.150, height: 0.100, amp: 0.011, speed: 0.29, rotation: -0.025 }
+];
+
+const ISLAND_TILT_RAD = 0.46; // Swift addIslandClone(): exact X-axis tilt
+const X_AXIS = new THREE.Vector3(1, 0, 0);
+const Y_AXIS = new THREE.Vector3(0, 1, 0);
+
+function applySwiftIslandOrientation(island, yaw = 0) {
+  // Swift: qx(0.46) * qy(yaw).
+  // The PI term only preserves the USD model's front-facing direction in Three.js.
+  const qx = new THREE.Quaternion().setFromAxisAngle(X_AXIS, ISLAND_TILT_RAD);
+  const qy = new THREE.Quaternion().setFromAxisAngle(Y_AXIS, Math.PI + yaw);
+  island.quaternion.copy(qx).multiply(qy);
+}
+
+const VOICE_POSITIONS = [
+  // Exact ImmersiveView.swift head-relative positions + the legacy 1.60 stage coordinate offset.
+  [-0.58, 1.80, -1.10], // Mum Singing in the Car
+  [-0.05, 1.96, -1.18], // A Call with Dad
+  [ 0.54, 1.81, -1.08], // Dad's Promise to Mum
+  [ 0.37, 1.28, -1.05], // Mum Singing Happy Birthday
+  [-0.36, 1.35, -1.05]  // Mum's Scary Story
+];
+
+function setStatus(text) { statusEl.textContent = text; }
+
+function clearStage() {
+  if (tutorialTimer) { clearTimeout(tutorialTimer); tutorialTimer = null; }
+  activeMedia.forEach(media => {
+    try { media.pause?.(); } catch (_) {}
+  });
+  activeMedia.clear();
+  interactables.length = 0;
+  animated.length = 0;
+  while (stageRoot.children.length) stageRoot.remove(stageRoot.children[0]);
+}
+
+function cacheTexture(path) {
+  if (!cachedTextures.has(path)) {
+    const t = textureLoader.load(path);
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    cachedTextures.set(path, t);
+  }
+  return cachedTextures.get(path);
+}
+
+function roundedRect(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
+function wrapText(ctx, text, maxWidth) {
+  const paragraphs = String(text).split('\n');
+  const lines = [];
+  for (const paragraph of paragraphs) {
+    const words = paragraph.split(/\s+/);
+    let line = '';
+    for (const word of words) {
+      const test = line ? `${line} ${word}` : word;
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line); line = word;
+      } else line = test;
+    }
+    if (line) lines.push(line);
+  }
+  return lines;
+}
+
+function fontString({ size, weight = 700, family = 'serif', italic = false }) {
+  const stack = family === 'sans' ? FONT_SANS : FONT_SERIF;
+  return `${italic ? 'italic ' : ''}${weight} ${size}px ${stack}`;
+}
+
+function makeCanvasTexture({
+  width = 1024, height = 512, title = '', body = '',
+  bg = 'rgba(244,249,255,0.88)', fg = '#1d3044', accent = '#5a84ad',
+  titleSize = 62, bodySize = 32, radius = 52, align = 'center', panel = true,
+  titleFont = 'serif', bodyFont = 'sans', titleWeight = 700, bodyWeight = 500,
+  titleItalic = false, bodyItalic = false
+} = {}) {
+  const c = document.createElement('canvas');
+  c.width = width; c.height = height;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, width, height);
+  if (panel) {
+    ctx.fillStyle = bg;
+    roundedRect(ctx, 8, 8, width - 16, height - 16, radius);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.78)';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+  }
+  ctx.fillStyle = fg;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'top';
+  ctx.font = fontString({ size: titleSize, weight: titleWeight, family: titleFont, italic: titleItalic });
+  const titleLines = wrapText(ctx, title, width - 120);
+  let y = body ? 72 : Math.max(60, height / 2 - titleLines.length * titleSize * 0.62);
+  for (const line of titleLines) {
+    ctx.fillText(line, align === 'center' ? width / 2 : 64, y);
+    y += titleSize * 1.06;
+  }
+  if (body) {
+    y += 22;
+    ctx.fillStyle = accent;
+    ctx.font = fontString({ size: bodySize, weight: bodyWeight, family: bodyFont, italic: bodyItalic });
+    const bodyLines = wrapText(ctx, body, width - 130);
+    for (const line of bodyLines.slice(0, 9)) {
+      ctx.fillText(line, align === 'center' ? width / 2 : 64, y);
+      y += bodySize * 1.35;
+    }
+  }
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return texture;
+}
+
+function getUiImage(src, onLoad) {
+  let img = cachedUiImages.get(src);
+  if (!img) {
+    img = new Image();
+    img.decoding = 'async';
+    img.src = src;
+    cachedUiImages.set(src, img);
+  }
+  if (img.complete && img.naturalWidth > 0) {
+    onLoad(img);
+  } else {
+    img.addEventListener('load', () => onLoad(img), { once: true });
+  }
+}
+
+function makeFixedControlFaceTexture(label, iconPath, { aspect = 3.4 } = {}) {
+  const c = document.createElement('canvas');
+  c.width = 1024;
+  c.height = Math.round(c.width / aspect);
+  const ctx = c.getContext('2d');
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+
+  const draw = (iconImg = null) => {
+    const w = c.width;
+    const h = c.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const iconSize = Math.round(h * 0.43);
+    const gap = Math.round(h * 0.14);
+    const radius = Math.round(h * 0.29);
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.18)';
+    ctx.shadowBlur = Math.round(h * 0.22);
+    ctx.shadowOffsetY = Math.round(h * 0.03);
+    ctx.fillStyle = 'rgba(140,130,121,0.30)';
+    roundedRect(ctx, 12, 12, w - 24, h - 24, radius);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = Math.max(2, Math.round(h * 0.014));
+    roundedRect(ctx, 12, 12, w - 24, h - 24, radius);
+    ctx.stroke();
+
+    ctx.font = `900 ${Math.round(h * 0.34)}px Inter, "Arial Black", system-ui, sans-serif`;
+    ctx.fillStyle = '#EDE7DF';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+
+    const textW = ctx.measureText(label).width;
+    const totalW = (iconImg ? iconSize + gap : 0) + textW;
+    const startX = (w - totalW) / 2;
+    const centerY = h / 2;
+
+    if (iconImg) {
+      ctx.save();
+      ctx.globalAlpha = 0.98;
+      ctx.drawImage(iconImg, startX, centerY - iconSize / 2, iconSize, iconSize);
+      ctx.restore();
+    }
+    ctx.fillText(label, startX + (iconImg ? iconSize + gap : 0), centerY + 2);
+
+    texture.needsUpdate = true;
+  };
+
+  draw();
+  if (iconPath) getUiImage(iconPath, (img) => draw(img));
+  return texture;
+}
+
+function makePlane({ width = 1, height = 0.5, texture = null, opacity = 1, position = [0,1.6,-2], rotation = [0,0,0], action = null, name = '' } = {}) {
+  const material = new THREE.MeshBasicMaterial({ map: texture, transparent: opacity < 1 || !!texture, opacity, side: THREE.DoubleSide, depthWrite: opacity >= 1 });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, height), material);
+  mesh.position.set(...position);
+  mesh.rotation.set(...rotation);
+  mesh.name = name;
+  if (action) {
+    mesh.userData.action = action;
+    interactables.push(mesh);
+  }
+  stageRoot.add(mesh);
+  return mesh;
+}
+
+function makeTextPanel(opts = {}) {
+  const texture = makeCanvasTexture(opts.canvas || {});
+  return makePlane({ ...opts, texture });
+}
+
+function makeButtonTexture(label, { bg = 'rgba(245,250,255,.90)', fg = '#1c334a' } = {}) {
+  const c = document.createElement('canvas');
+  c.width = 700;
+  c.height = 240;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+
+  ctx.fillStyle = bg;
+  roundedRect(ctx, 8, 8, c.width - 16, c.height - 16, 90);
+  ctx.fill();
+
+  // Preserve the original button edge while centering the label exactly,
+  // matching SwiftUI Text inside the fixed-height button frame.
+  ctx.strokeStyle = 'rgba(255,255,255,.78)';
+  ctx.lineWidth = 4;
+  roundedRect(ctx, 8, 8, c.width - 16, c.height - 16, 90);
+  ctx.stroke();
+
+  ctx.font = fontString({ size: 64, weight: 700, family: 'sans' });
+  ctx.fillStyle = fg;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, c.width / 2, c.height / 2);
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return texture;
+}
+
+function makeTransparentTextTexture(label, { fg = '#EDE7DF', fontSize = 56 } = {}) {
+  const c = document.createElement('canvas');
+  c.width = 900;
+  c.height = 220;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.font = fontString({ size: fontSize, weight: 900, family: 'sans' });
+  ctx.fillStyle = fg;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, c.width / 2, c.height / 2 + 2);
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function makeControlTextTexture(label) {
+  const scale = 4;
+  const measureCanvas = document.createElement('canvas');
+  const measureCtx = measureCanvas.getContext('2d');
+  measureCtx.font = `700 ${CONTROL_FONT_PX}px "Playfair Display", Georgia, serif`;
+  const measured = Math.ceil(measureCtx.measureText(label).width);
+  const widthPx = measured + 8;
+  const heightPx = 42;
+
+  const c = document.createElement('canvas');
+  c.width = widthPx * scale;
+  c.height = heightPx * scale;
+  const ctx = c.getContext('2d');
+  ctx.scale(scale, scale);
+  ctx.clearRect(0, 0, widthPx, heightPx);
+  ctx.font = `700 ${CONTROL_FONT_PX}px "Playfair Display", Georgia, serif`;
+  ctx.fillStyle = '#EDE7DF';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, widthPx / 2, heightPx / 2 + 1);
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return { texture, widthPx, heightPx };
+}
+
+function roundedRectShape(width, height, radius) {
+  const x = -width / 2;
+  const y = -height / 2;
+  const r = Math.min(radius, width / 2, height / 2);
+  const shape = new THREE.Shape();
+  shape.moveTo(x + r, y);
+  shape.lineTo(x + width - r, y);
+  shape.quadraticCurveTo(x + width, y, x + width, y + r);
+  shape.lineTo(x + width, y + height - r);
+  shape.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  shape.lineTo(x + r, y + height);
+  shape.quadraticCurveTo(x, y + height, x, y + height - r);
+  shape.lineTo(x, y + r);
+  shape.quadraticCurveTo(x, y, x + r, y);
+  return shape;
+}
+
+function makeFixedControlButton(label, iconPath, position, action, {
+  depth = 0.0052,
+  paddingX = CONTROL_PAD_X_PX,
+  paddingY = CONTROL_PAD_Y_PX,
+  radiusPx = CONTROL_RADIUS_PX
+} = {}) {
+  const textAsset = makeControlTextTexture(label);
+  const heightPx = Math.max(CONTROL_ICON_PX, CONTROL_FONT_PX) + paddingY * 2;
+  const widthPx = paddingX * 2 + CONTROL_ICON_PX + CONTROL_GAP_PX + textAsset.widthPx;
+
+  const width = widthPx * CONTROL_M_PER_PX;
+  const height = heightPx * CONTROL_M_PER_PX;
+  const radius = radiusPx * CONTROL_M_PER_PX;
+  const iconSize = CONTROL_ICON_PX * CONTROL_M_PER_PX;
+  const gap = CONTROL_GAP_PX * CONTROL_M_PER_PX;
+  const textWidth = textAsset.widthPx * CONTROL_M_PER_PX;
+  const textHeight = textAsset.heightPx * CONTROL_M_PER_PX;
+
+  const group = new THREE.Group();
+  group.position.set(...position);
+
+  const shape = roundedRectShape(width, height, radius);
+
+  // Thin RealityKit-like depth body.
+  const bodyGeo = new THREE.ExtrudeGeometry(shape, {
+    depth,
+    bevelEnabled: true,
+    bevelThickness: Math.min(depth * 0.32, 0.0022),
+    bevelSize: Math.min(0.0028, radius * 0.18),
+    bevelSegments: 4,
+    curveSegments: 16
+  });
+  bodyGeo.translate(0, 0, -depth - 0.0015);
+  const body = new THREE.Mesh(bodyGeo, new THREE.MeshPhysicalMaterial({
+    color: 0xded6cf,
+    transparent: true,
+    opacity: 0.18,
+    roughness: 0.05,
+    metalness: 0,
+    transmission: 0.55,
+    clearcoat: 1,
+    clearcoatRoughness: 0.03,
+    side: THREE.DoubleSide,
+    depthWrite: false
+  }));
+  body.userData.action = action;
+  interactables.push(body);
+  group.add(body);
+
+  // Rounded front face (same shape, no rectangular overlay).
+  const face = new THREE.Mesh(new THREE.ShapeGeometry(shape, 16), new THREE.MeshBasicMaterial({
+    color: 0xf2ede8,
+    transparent: true,
+    opacity: 0.16,
+    side: THREE.DoubleSide,
+    depthWrite: false
+  }));
+  face.position.z = 0.002;
+  face.userData.action = action;
+  interactables.push(face);
+  group.add(face);
+
+  const gloss = new THREE.Mesh(new THREE.ShapeGeometry(shape, 16), new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.08,
+    side: THREE.DoubleSide,
+    depthWrite: false
+  }));
+  gloss.position.set(0, 0.002, 0.0034);
+  gloss.scale.set(0.985, 0.90, 1);
+  gloss.userData.action = action;
+  interactables.push(gloss);
+  group.add(gloss);
+
+  const contentWidth = iconSize + gap + textWidth;
+  const startX = -contentWidth / 2;
+
+  const icon = new THREE.Mesh(
+    new THREE.PlaneGeometry(iconSize, iconSize),
+    new THREE.MeshBasicMaterial({
+      map: cacheTexture(iconPath),
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    })
+  );
+  icon.position.set(startX + iconSize / 2, 0, 0.004);
+  icon.userData.action = action;
+  interactables.push(icon);
+  group.add(icon);
+
+  const text = new THREE.Mesh(
+    new THREE.PlaneGeometry(textWidth, textHeight),
+    new THREE.MeshBasicMaterial({
+      map: textAsset.texture,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    })
+  );
+  text.position.set(startX + iconSize + gap + textWidth / 2, 0, 0.0042);
+  text.userData.action = action;
+  interactables.push(text);
+  group.add(text);
+
+  stageRoot.add(group);
+  return group;
+}
+
+function makeButton(label, position, action, { width = 0.34, height = 0.12, bg = 'rgba(245,250,255,.90)', fg = '#1c334a' } = {}) {
+  return makePlane({
+    width, height, position, action,
+    texture: makeButtonTexture(label, { bg, fg })
+  });
+}
+
+function makeImageCard(memory, layout) {
+  const group = new THREE.Group();
+  group.position.set(...layout.position);
+  group.userData.action = () => openMemory(memory);
+
+  // Each memory owns its own island, matching Swift addMemoryIslands().
+  if (islandModel) {
+    const island = centeredScaledClone(islandModel, layout.islandSize);
+    applySwiftIslandOrientation(island, layout.yaw || 0);
+    island.position.set(0, 0, 0);
+    group.add(island);
+  }
+
+  if (memory.type === 'object' && jungfrauModel) {
+    // Real USDZ object, planted into the island rather than shown as a flat card.
+    const object = centeredScaledClone(jungfrauModel, layout.objectSize || 0.145);
+    object.position.set(0, layout.cardY || 0.07, 0.045);
+    object.rotation.y = -0.12;
+    group.add(object);
+  } else {
+    let preview;
+    if (memory.type === 'photo') preview = cacheTexture(memory.asset);
+    else if (memory.type === 'video') preview = makeVideoPreviewTexture(memory.asset);
+    else preview = cacheTexture('./assets/images/jungfrau-reflection.png');
+
+    const card = new THREE.Mesh(
+      new THREE.PlaneGeometry(layout.cardW || 0.18, layout.cardH || 0.13),
+      new THREE.MeshBasicMaterial({
+        map: preview,
+        transparent: true,
+        side: THREE.DoubleSide,
+        depthWrite: false
+      })
+    );
+    card.position.set(0, layout.cardY || 0.08, 0.055);
+    group.add(card);
+  }
+
+  // No memory-name label on the open island view: this matches the Swift attachment.
+  group.traverse(o => {
+    o.userData.action = group.userData.action;
+    if (o.isMesh) interactables.push(o);
+  });
+  stageRoot.add(group);
+  return group;
+}
+
+function setIsleBackground(kind = 'heaven') {
+  const path = kind === 'voice' ? './assets/images/island.jpg' : './assets/images/sky.jpg';
+  const texture = cacheTexture(path);
+  texture.mapping = THREE.EquirectangularReflectionMapping;
+  texture.needsUpdate = true;
+  scene.background = texture;
+  // Swift voice sky applies a subtle ~20% black tint; backgroundIntensity keeps UI unaffected.
+  scene.backgroundIntensity = kind === 'voice' ? 0.80 : 1.00;
+  scene.backgroundBlurriness = 0;
+}
+
+function makeStageIntroTexture(title, subtitle) {
+  const c = document.createElement('canvas');
+  c.width = 1200;
+  c.height = 300;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff';
+  ctx.shadowColor = 'rgba(0,0,0,0.34)';
+  ctx.shadowBlur = 24;
+  ctx.shadowOffsetX = 0;
+  ctx.shadowOffsetY = 2;
+
+  ctx.font = '700 76px "Playfair Display", Georgia, serif';
+  ctx.fillText(title, c.width / 2, 108);
+
+  ctx.shadowBlur = 18;
+  ctx.font = '500 36px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  ctx.fillText(subtitle, c.width / 2, 205);
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function makeTransientStageIntro(title, subtitle, position, remainingMs) {
+  if (remainingMs <= 0) return null;
+  const intro = makePlane({
+    width: 0.82,
+    height: 0.205,
+    position,
+    texture: makeStageIntroTexture(title, subtitle),
+    opacity: 1
+  });
+  // Render caption above spatial objects without adding a panel/background.
+  intro.material.depthWrite = false;
+  intro.renderOrder = 20;
+
+  const fadeMs = Math.min(INTRO_FADE_MS, remainingMs);
+  const holdMs = Math.max(0, remainingMs - fadeMs);
+  animated.push({
+    type: 'stageIntro',
+    object: intro,
+    startedAt: clock.getElapsedTime(),
+    hold: holdMs / 1000,
+    fade: Math.max(0.001, fadeMs / 1000)
+  });
+  return intro;
+}
+
+function makeVoiceLabelTexture(text, fontPx) {
+  const c = document.createElement('canvas');
+  c.width = 1000;
+  c.height = 360;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff';
+  ctx.shadowColor = 'rgba(0,0,0,0.28)';
+  ctx.shadowBlur = 18;
+  ctx.font = `700 ${Math.round(fontPx * 2.25)}px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+  const lines = String(text).split('\n');
+  const lineHeight = Math.round(fontPx * 4.0 * 1.08);
+  const startY = c.height / 2 - ((lines.length - 1) * lineHeight) / 2;
+  lines.forEach((line, i) => ctx.fillText(line, c.width / 2, startY + i * lineHeight));
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function makeVideoPreviewTexture(path) {
+  const key = `preview:${path}`;
+  if (cachedTextures.has(key)) return cachedTextures.get(key);
+  const c = document.createElement('canvas'); c.width = 960; c.height = 720;
+  const ctx = c.getContext('2d');
+  const g = ctx.createLinearGradient(0,0,960,720); g.addColorStop(0,'#c8ddf1'); g.addColorStop(1,'#8fb4d5');
+  ctx.fillStyle = g; ctx.fillRect(0,0,960,720);
+  ctx.fillStyle = 'rgba(255,255,255,.92)'; ctx.beginPath(); ctx.arc(480,360,88,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#456987'; ctx.beginPath(); ctx.moveTo(458,314); ctx.lineTo(458,406); ctx.lineTo(536,360); ctx.closePath(); ctx.fill();
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  cachedTextures.set(key, t); return t;
+}
+
+function makeOrb(voice, position, index) {
+  // VoiceIsleView.swift uses a flat radial-gradient Circle (Voice.svg), not a 3D sphere.
+  const group = new THREE.Group();
+  group.position.set(...position);
+  const pxToM = 0.00110;
+  const orbSize = voice.orbPx * pxToM;
+  const labelWidth = Math.max((voice.orbPx + 50) * pxToM, 230 * pxToM);
+  const labelHeight = 0.100;
+  const gap = 29 * pxToM;
+
+  const orb = new THREE.Mesh(
+    new THREE.PlaneGeometry(orbSize, orbSize),
+    new THREE.MeshBasicMaterial({
+      map: cacheTexture('./assets/icons/voice.svg'),
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    })
+  );
+  orb.position.set(0, 0, 0);
+  group.add(orb);
+
+  const label = new THREE.Mesh(
+    new THREE.PlaneGeometry(labelWidth, labelHeight),
+    new THREE.MeshBasicMaterial({
+      map: makeVoiceLabelTexture(voice.title, voice.titlePx),
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    })
+  );
+  label.position.set(0, -(orbSize / 2 + gap + labelHeight / 2), 0.002);
+  group.add(label);
+
+  const action = () => openVoice(voice);
+  group.userData.action = action;
+  [orb, label].forEach(mesh => {
+    mesh.userData.action = action;
+    interactables.push(mesh);
+  });
+  stageRoot.add(group);
+  return group;
+}
+
+function makePortal(label, position, action, hue = 0x92c8ff) {
+  const group = new THREE.Group();
+  group.position.set(...position);
+
+  const asset = label === 'Heaven Isle'
+    ? './assets/icons/heaven-portal.svg'
+    : './assets/icons/voice-portal.svg';
+
+  const width = 0.245;
+  const height = width * (425 / 350);
+  const portal = new THREE.Mesh(
+    new THREE.PlaneGeometry(width, height),
+    new THREE.MeshBasicMaterial({
+      map: cacheTexture(asset),
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    })
+  );
+  portal.userData.action = action;
+  interactables.push(portal);
+  group.add(portal);
+
+  // Swift IslePortalView has a gentle float/breathe animation.
+  animated.push({ type: 'portalFloat', object: group, baseY: position[1], amp: 0.010, speed: 0.31, phase: 0 });
+  stageRoot.add(group);
+  return group;
+}
+
+function makeBack() { return makeFixedControlButton('Back', './assets/icons/icon_back.svg', [0.86, 2.00, -0.92], goBack, { depth: 0.0076 }); }
+function makeExit() { return makeFixedControlButton('Exit Island', './assets/icons/icon_exit.svg', [0.86, 2.00, -0.92], openExitPrompt); }
+
+
+function tutorialScaledRect(rect) {
+  const cx = TUTORIAL_FRAME_PX.width / 2;
+  const cy = TUTORIAL_FRAME_PX.height / 2;
+  return {
+    x: cx + (rect.x - cx) * TUTORIAL_SCALE,
+    y: cy + (rect.y - cy) * TUTORIAL_SCALE,
+    w: rect.w * TUTORIAL_SCALE,
+    h: rect.h * TUTORIAL_SCALE
+  };
+}
+
+function drawText(ctx, text, x, y, {
+  size, weight = 400, family = 'sans', color = '#000', align = 'left',
+  italic = false, lineHeight = 1.2
+}) {
+  ctx.save();
+  ctx.font = fontString({ size, weight, family, italic });
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'top';
+  const lines = String(text).split('\n');
+  lines.forEach((line, i) => ctx.fillText(line, x, y + i * size * lineHeight));
+  ctx.restore();
+}
+
+function drawGlassPanel(ctx, x, y, w, h, radius = 50) {
+  ctx.save();
+  // Swift: ultraThinMaterial + warm 243/240/237 @ 0.60 + subtle white strokes/shadow.
+  ctx.shadowColor = 'rgba(255,255,255,0.20)';
+  ctx.shadowBlur = 50;
+  ctx.fillStyle = 'rgba(243,240,237,0.78)';
+  roundedRect(ctx, x, y, w, h, radius);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 10;
+  roundedRect(ctx, x, y, w, h, radius);
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.lineWidth = 0.5;
+  roundedRect(ctx, x, y, w, h, radius);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawCapsule(ctx, x, y, w, h, { fill, text, textColor }) {
+  ctx.save();
+  ctx.fillStyle = fill;
+  roundedRect(ctx, x, y, w, h, h / 2);
+  ctx.fill();
+
+  // Swift GradientActionButton / SecondaryActionButton:
+  // Text is centered inside a fixed 68pt-high frame.
+  ctx.font = fontString({ size: 24, weight: 700, family: 'sans' });
+  ctx.fillStyle = textColor;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, x + w / 2, y + h / 2);
+  ctx.restore();
+}
+
+function drawTutorialImage(ctx, key, x, y, w, h) {
+  const img = tutorialAssets.get(key);
+  if (!img) return;
+  ctx.drawImage(img, x, y, w, h);
+}
+
+function createTutorialCanvas(step) {
+  const c = document.createElement('canvas');
+  c.width = TUTORIAL_FRAME_PX.width;
+  c.height = TUTORIAL_FRAME_PX.height;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  const hits = [];
+
+  // Mirrors TutorialFlowView.currentStepView.scaleEffect(1.08).
+  ctx.save();
+  ctx.translate(c.width / 2, c.height / 2);
+  ctx.scale(TUTORIAL_SCALE, TUTORIAL_SCALE);
+  ctx.translate(-c.width / 2, -c.height / 2);
+
+  if (step === 'islandName') {
+    drawText(ctx, 'Heaven Isle', 960, 540 - 55, {
+      size: 82, weight: 600, family: 'serif', color: '#ffffff', align: 'center', lineHeight: 1
+    });
+  }
+
+  if (step === 'welcome') {
+    const panelW = 720;
+    const panelH = 434;
+    const x = (1920 - panelW) / 2;
+    const y = (1080 - panelH) / 2;
+    drawGlassPanel(ctx, x, y, panelW, panelH, 50);
+    const left = x + 60;
+    let cy = y + 68;
+    drawText(ctx, 'Welcome to Heaven Isle', left, cy, {
+      size: 50, weight: 700, family: 'serif', color: '#000000'
+    });
+    cy += 60 + 20;
+    drawText(ctx,
+      'Look at a memory, then pinch to open it.\nFollow the portals to explore different parts\nof your island.',
+      left, cy,
+      { size: 22, weight: 500, family: 'sans', color: '#7A736C', lineHeight: 1.36 }
+    );
+    cy += 90 + 60;
+    const totalButtonsW = 220 + 16 + 220;
+    const bx = x + (panelW - totalButtonsW) / 2;
+    drawCapsule(ctx, bx, cy, 220, 68, {
+      fill: '#EDE7DF', text: 'Start Tutorial', textColor: '#8C8279'
+    });
+    drawCapsule(ctx, bx + 236, cy, 220, 68, {
+      fill: 'rgba(255,255,255,0.20)', text: 'Start Exploring', textColor: '#434343'
+    });
+    hits.push({ ...tutorialScaledRect({ x: bx, y: cy, w: 220, h: 68 }), action: () => { tutorialIndex = 3; renderTutorial(); } });
+    hits.push({ ...tutorialScaledRect({ x: bx + 236, y: cy, w: 220, h: 68 }), action: () => renderHeaven(true) });
+  }
+
+  if (step === 'gestures') {
+    // Swift source: FigmaPopupContainer(width: 1320, horizontalPadding: 80),
+    // HStack spacing 69, each GestureGuide fixed to 400pt height.
+    // Final Figma reference node 832:8280 places the rendered panel at 1321×846.
+    const panelW = 1321;
+    const panelH = 846;
+    const x = (1920 - panelW) / 2;
+    const y = (1080 - panelH) / 2;
+    drawGlassPanel(ctx, x, y, panelW, panelH, 50);
+
+    // Exact Figma/Swift header positions.
+    const left = x + 80;
+    drawText(ctx, 'Tutorial', left, y + 68, {
+      size: 50, weight: 700, family: 'serif', color: '#000'
+    });
+    drawText(ctx, 'Here are a few gestures to get you started.', left, y + 155, {
+      size: 24, weight: 500, family: 'sans', color: '#7A736C'
+    });
+
+    // Gesture row: 3 × 341pt columns, 69pt gaps, 400pt height.
+    const rowY = y + 249;
+    const cols = [
+      {
+        x: left,
+        title: 'Gaze',
+        desc: 'Look at an item\nto bring it into focus.',
+        asset: 'gaze',
+        // The exported Gaze SVG intentionally overhangs its 341×287 Figma frame.
+        imageX: 0, imageY: 95, imageW: 370, imageH: 305
+      },
+      {
+        x: left + 410,
+        title: 'Pinch',
+        desc: 'Bring your thumb and index finger together\nto select or open it.',
+        asset: 'pinch',
+        imageX: 0, imageY: 113, imageW: 341, imageH: 287
+      },
+      {
+        x: left + 820,
+        title: 'Zoom',
+        desc: 'Pinch with both hands,\nthen move them apart to zoom in.',
+        asset: 'zoom',
+        imageX: 0, imageY: 113, imageW: 341, imageH: 287
+      }
+    ];
+
+    cols.forEach((item) => {
+      const cx = item.x + 341 / 2;
+      drawText(ctx, item.title, cx, rowY, {
+        size: 30, weight: 500, family: 'sans', color: '#000', align: 'center'
+      });
+      drawText(ctx, item.desc, cx, rowY + 50, {
+        size: 16, weight: 400, family: 'sans', color: '#434343',
+        align: 'center', italic: true, lineHeight: 1.4
+      });
+      drawTutorialImage(
+        ctx,
+        item.asset,
+        item.x + item.imageX,
+        rowY + item.imageY,
+        item.imageW,
+        item.imageH
+      );
+    });
+
+    // Figma node 832:8338: x 510.5, y 709, 300×69 within the panel.
+    const bx = x + 510.5;
+    const by = y + 709;
+    drawCapsule(ctx, bx, by, 300, 69, {
+      fill: '#EDE7DF', text: 'Next', textColor: '#8C8279'
+    });
+    hits.push({
+      ...tutorialScaledRect({ x: bx, y: by, w: 300, h: 69 }),
+      action: () => { tutorialIndex = 4; renderTutorial(); }
+    });
+  }
+
+  const tutorialCards = {
+    catchMemory: {
+      panelW: 760, panelH: 752, padX: 70,
+      heading: '1. Catch a memory', desc: 'Look at a memory, then pinch to open it.',
+      image: 'tutorial-1', imageW: 356.636, imageH: 320, beforeImage: 40, afterImage: 40, button: 'Next'
+    },
+    comfortThings: {
+      panelW: 790, panelH: 743, padX: 65,
+      heading: '2. Explore your comfort things', desc: 'Open photos, videos and familiar voices.',
+      image: 'tutorial-2', imageW: 622, imageH: 311, beforeImage: 40, afterImage: 40, button: 'Next'
+    },
+    customiseIsland: {
+      panelW: 760, panelH: 807, padX: 70,
+      heading: '3. Make the island yours', desc: 'Use the menu to add or remove comfort items\nand adjust the atmosphere.',
+      image: 'tutorial-3', imageW: 469, imageH: 380, beforeImage: 40, afterImage: 40, button: 'Next'
+    },
+    portal: {
+      panelW: 760, panelH: 822, padX: 70,
+      heading: '4. Travel between islands', desc: 'Pinch a portal to move between spaces.',
+      image: 'tutorial-4', imageW: 307, imageH: 372, beforeImage: 54, afterImage: 44, button: 'Enter Heaven Isle'
+    }
+  };
+
+  if (tutorialCards[step]) {
+    const cfg = tutorialCards[step];
+    const x = (1920 - cfg.panelW) / 2;
+    const y = (1080 - cfg.panelH) / 2;
+    drawGlassPanel(ctx, x, y, cfg.panelW, cfg.panelH, 50);
+    const left = x + cfg.padX;
+    let cy = y + 68;
+    drawText(ctx, 'Tutorial', left, cy, { size: 50, weight: 700, family: 'serif', color: '#000' });
+    cy += 60 + 20;
+    drawText(ctx, cfg.heading, left, cy, { size: 30, weight: 500, family: 'sans', color: '#000' });
+    cy += 36 + 8;
+    drawText(ctx, cfg.desc, left, cy, { size: 20, weight: 400, family: 'sans', color: '#434343', lineHeight: 1.2 });
+    const descLines = cfg.desc.split('\n').length;
+    cy += descLines * 24 + cfg.beforeImage;
+    const ix = x + (cfg.panelW - cfg.imageW) / 2;
+    drawTutorialImage(ctx, cfg.image, ix, cy, cfg.imageW, cfg.imageH);
+    cy += cfg.imageH + cfg.afterImage;
+    const bx = x + (cfg.panelW - 300) / 2;
+    drawCapsule(ctx, bx, cy, 300, 68, { fill: '#EDE7DF', text: cfg.button, textColor: '#8C8279' });
+    const nextAction = step === 'portal'
+      ? () => renderHeaven(true)
+      : () => { tutorialIndex += 1; renderTutorial(); };
+    hits.push({ ...tutorialScaledRect({ x: bx, y: cy, w: 300, h: 68 }), action: nextAction });
+  }
+
+  ctx.restore();
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return { texture, hits };
+}
+
+function addTutorialHitArea(rect) {
+  const px = rect.x + rect.w / 2;
+  const py = rect.y + rect.h / 2;
+  const x = TUTORIAL_CENTER[0] + (px / TUTORIAL_FRAME_PX.width - 0.5) * TUTORIAL_FRAME_M.width;
+  const y = TUTORIAL_CENTER[1] + (0.5 - py / TUTORIAL_FRAME_PX.height) * TUTORIAL_FRAME_M.height;
+  const w = rect.w / TUTORIAL_FRAME_PX.width * TUTORIAL_FRAME_M.width;
+  const h = rect.h / TUTORIAL_FRAME_PX.height * TUTORIAL_FRAME_M.height;
+  const hit = new THREE.Mesh(
+    new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide })
+  );
+  hit.position.set(x, y, TUTORIAL_CENTER[2] + 0.006);
+  hit.userData.action = rect.action;
+  interactables.push(hit);
+  stageRoot.add(hit);
+}
+
+function addTutorialBack() {
+  if (tutorialIndex < 3) return;
+  makeFixedControlButton('Back', './assets/icons/icon_back.svg', [0.86, 2.00, -0.92], () => {
+    if (tutorialIndex === 3) tutorialIndex = 2;
+    else tutorialIndex -= 1;
+    renderTutorial();
+  }, { depth: 0.0076 });
+}
+
+function applyTutorialEntrance(object) {
+  object.scale.setScalar(0.97);
+  const mats = [];
+  object.traverse(o => {
+    if (o.material) {
+      const materialList = Array.isArray(o.material) ? o.material : [o.material];
+      materialList.forEach(m => { m.transparent = true; m.opacity = 0; mats.push(m); });
+    }
+  });
+  animated.push({ type: 'tutorialEnter', object, mats, startedAt: clock.getElapsedTime(), duration: 0.55 });
+}
+
+function renderTutorial() {
+  clearStage();
+  currentStage = 'tutorial';
+  const step = TUTORIAL_STEPS[tutorialIndex] || 'intro';
+  setStatus(step === 'intro' ? 'Opening' : step === 'islandName' ? 'Heaven Isle' : `Tutorial ${tutorialIndex + 1}/8`);
+
+  // Swift introView: Image("Isle Logo").scaledToFit().frame(width: 300, height: 150), then scaleEffect(1.08).
+  if (step === 'intro') {
+    const logo = makePlane({
+      width: .300 * TUTORIAL_SCALE,
+      height: .140 * TUTORIAL_SCALE,
+      position: TUTORIAL_CENTER,
+      texture: cacheTexture('./assets/icons/isle-logo.svg')
+    });
+    applyTutorialEntrance(logo);
+    tutorialTimer = setTimeout(() => { tutorialIndex = 1; renderTutorial(); }, 1300);
+    return;
+  }
+
+  const { texture, hits } = createTutorialCanvas(step);
+  const plane = new THREE.Mesh(
+    new THREE.PlaneGeometry(TUTORIAL_FRAME_M.width, TUTORIAL_FRAME_M.height),
+    new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false, side: THREE.DoubleSide })
+  );
+  plane.position.set(...TUTORIAL_CENTER);
+  // Use the visible tutorial plane itself for hit testing.
+  // This keeps the click/pinch target pixel-perfect with the rendered button
+  // and prevents Start Tutorial from accidentally triggering Start Exploring.
+  if (hits.length) {
+    plane.userData.tutorialHits = hits;
+    interactables.push(plane);
+  }
+  stageRoot.add(plane);
+  applyTutorialEntrance(plane);
+  addTutorialBack();
+
+  if (step === 'islandName') {
+    tutorialTimer = setTimeout(() => { tutorialIndex = 2; renderTutorial(); }, 1500);
+  }
+}
+
+function renderHeaven(showMessage = false) {
+  if (showMessage) heavenIntroUntil = performance.now() + INTRO_HOLD_MS + INTRO_FADE_MS;
+  clearStage();
+  currentStage = 'heaven';
+  randomMode = false;
+  setIsleBackground('heaven');
+  setStatus('Heaven Isle · Memory Catch');
+
+  // Six memory-island clusters, each with its own position and scale from Swift/Figma.
+  MEMORY.forEach((memory) => {
+    const layout = MEMORY_LAYOUT[memory.id];
+    if (layout) makeImageCard(memory, layout);
+  });
+
+  // Floating notes use the original Swift paper layout and varied sizes.
+  NOTE_LAYOUT.forEach((cfg, i) => {
+    const plane = makePlane({
+      width: cfg.width,
+      height: cfg.height,
+      position: cfg.position,
+      texture: cacheTexture(`./assets/images/note-${i + 1}.png`),
+      action: () => openNote(i + 1),
+      opacity: 1
+    });
+    plane.rotation.z = cfg.rotation;
+    animated.push({
+      type: 'float',
+      object: plane,
+      amp: cfg.amp,
+      speed: cfg.speed,
+      phase: i * 0.9,
+      baseY: cfg.position[1]
+    });
+  });
+
+  // The old giant centre island is intentionally removed. The Voice Isle portal occupies the lower centre.
+  makePortal('Voice Isle', [0.00, 1.13, -1.05], () => renderVoiceIsle(true), 0xffb88f);
+
+  makeFixedControlButton('Surprise Me!', './assets/icons/icon_surprise.svg', [-0.86, 1.20, -0.92], renderRandomMode);
+  makeExit();
+  makeFixedControlButton('settings', './assets/icons/icon_setting.svg', [-0.86, 2.00, -0.92], () => showToast('Settings are not connected in this web prototype yet.'));
+
+  const heavenIntroRemaining = heavenIntroUntil - performance.now();
+  if (heavenIntroRemaining > 0) {
+    makeTransientStageIntro(
+      'Memory Catch',
+      'Pinch a memory to revisit a familiar moment.',
+      [0, 1.60, -0.91],
+      heavenIntroRemaining
+    );
+  }
+}
+
+function renderRandomMode() {
+  clearStage();
+  currentStage = 'heaven';
+  randomMode = true;
+  setStatus('Heaven Isle · Surprise Me');
+
+  randomMemories = [...MEMORY].sort(() => Math.random() - .5);
+  const slots = [1, 2, 3, 4, 6, 5];
+
+  slots.forEach((memoryId, i) => {
+    const layout = MEMORY_LAYOUT[memoryId];
+    if (!layout) return;
+
+    // Keep the same six island centres as normal mode, as in Swift.
+    if (islandModel) {
+      const island = centeredScaledClone(islandModel, layout.islandSize);
+      island.position.set(...layout.position);
+      applySwiftIslandOrientation(island, layout.yaw || 0);
+      stageRoot.add(island);
+    }
+
+    const r = [0.085, 0.105, 0.065, 0.095, 0.070, 0.060][i];
+    const bubble = new THREE.Mesh(
+      new THREE.SphereGeometry(r, 36, 20),
+      new THREE.MeshPhysicalMaterial({
+        color: 0xe7f6ff,
+        transparent: true,
+        opacity: .38,
+        roughness: .05,
+        transmission: .35,
+        clearcoat: 1,
+        emissive: 0x7db7df,
+        emissiveIntensity: .12
+      })
+    );
+    bubble.position.set(
+      layout.position[0],
+      layout.position[1] + (layout.cardY || 0.08),
+      layout.position[2] + 0.055
+    );
+    bubble.userData.action = () => openMemory(randomMemories[i]);
+    interactables.push(bubble);
+    stageRoot.add(bubble);
+    animated.push({
+      type: 'float',
+      object: bubble,
+      amp: .012,
+      speed: .34 + i * .015,
+      phase: i * .7,
+      baseY: bubble.position.y
+    });
+  });
+
+  makeFixedControlButton('Normal Mode', './assets/icons/icon_normal.svg', [-0.86, 1.20, -0.92], () => renderHeaven(false));
+  makeExit();
+}
+
+function addIslandToStage() {
+  if (islandModel) {
+    const clone = centeredScaledClone(islandModel, 1.15);
+    clone.position.set(0, .93 + HOME_Y_OFFSET, -2.55);
+    clone.rotation.y = Math.PI;
+    stageRoot.add(clone);
+  } else {
+    const fallback = makePlane({ width:1.20,height:.53,position:[0,.95 + HOME_Y_OFFSET,-2.62],texture:cacheTexture('./assets/images/island.jpg'),opacity:.98 });
+    fallback.rotation.x = -.06;
+  }
+}
+
+function openMemory(memory) {
+  selectedMemory = memory;
+  if (memory.type === 'photo') renderPhotoDetail(memory);
+  else if (memory.type === 'video') renderVideoDetail(memory);
+  else renderObjectDetail(memory);
+}
+
+function renderPhotoDetail(memory) {
+  clearStage(); currentStage = 'photoDetail'; setStatus(memory.title); makeBack();
+  makePlane({ width:.90,height:.675,position:[-.42,1.60,-2.18],texture:cacheTexture(memory.asset) });
+  makeTextPanel({ width:.76,height:.72,position:[.48,1.57,-2.18],canvas:{width:950,height:900,title:memory.title,body:memory.description,titleSize:54,bodySize:29,bg:'rgba(248,251,255,.91)',align:'left'} });
+  makeButton('View Full Screen', [.46,1.10,-2.00], () => renderPhotoCinema(memory), { width:.48 });
+}
+
+function renderPhotoCinema(memory) {
+  clearStage(); currentStage = 'photoCinema'; setStatus(`${memory.title} · Cinema`); makeBack();
+  const backdrop = new THREE.Mesh(new THREE.PlaneGeometry(2.5,1.45),new THREE.MeshBasicMaterial({color:0x050607,transparent:true,opacity:.96})); backdrop.position.set(0,1.55,-2.55); stageRoot.add(backdrop);
+  makePlane({ width:1.52,height:1.14,position:[0,1.57,-2.20],texture:cacheTexture(memory.asset) });
+}
+
+function createVideo(path, loop = true) {
+  const video = document.createElement('video');
+  video.src = path; video.loop = loop; video.muted = false; video.playsInline = true; video.preload = 'metadata';
+  activeMedia.add(video); return video;
+}
+
+function renderVideoDetail(memory) {
+  clearStage(); currentStage = 'videoDetail'; setStatus(memory.title); makeBack();
+  makePlane({ width:.90,height:.675,position:[-.42,1.60,-2.18],texture:makeVideoPreviewTexture(memory.asset) });
+  makeTextPanel({ width:.76,height:.72,position:[.48,1.57,-2.18],canvas:{width:950,height:900,title:memory.title,body:memory.description,titleSize:54,bodySize:29,bg:'rgba(248,251,255,.91)',align:'left'} });
+  makeButton('Play Full Screen', [.46,1.10,-2.00], () => renderVideoCinema(memory), { width:.48 });
+}
+
+function renderVideoCinema(memory) {
+  clearStage(); currentStage = 'videoCinema'; setStatus(`${memory.title} · Cinema`); makeBack();
+  const video = createVideo(memory.asset);
+  const texture = new THREE.VideoTexture(video); texture.colorSpace = THREE.SRGBColorSpace;
+  const backdrop = new THREE.Mesh(new THREE.PlaneGeometry(2.6,1.5),new THREE.MeshBasicMaterial({color:0x050607})); backdrop.position.set(0,1.55,-2.55); stageRoot.add(backdrop);
+  makePlane({ width:1.58,height:.89,position:[0,1.57,-2.20],texture });
+  video.play().catch(() => showToast('Pinch/click the video once to start playback.'));
+}
+
+function renderObjectDetail(memory) {
+  clearStage(); currentStage = 'objectDetail'; setStatus(memory.title); makeBack();
+  if (jungfrauModel) {
+    const model = centeredScaledClone(jungfrauModel, .48); model.position.set(-.44,1.48,-2.20); model.rotation.set(.08,-.25,0); stageRoot.add(model);
+    model.traverse(o => { if (o.isMesh) { o.userData.action = () => renderObjectExpanded(memory); interactables.push(o); } });
+  } else makePlane({width:.62,height:.46,position:[-.44,1.55,-2.15],texture:cacheTexture('./assets/images/jungfrau-reflection.png'),action:() => renderObjectExpanded(memory)});
+  makeTextPanel({ width:.80,height:.72,position:[.46,1.57,-2.18],canvas:{width:950,height:900,title:memory.title,body:memory.description,titleSize:54,bodySize:29,bg:'rgba(248,251,255,.91)',align:'left'} });
+  makeButton('View Larger', [.46,1.10,-2.00], () => renderObjectExpanded(memory), { width:.40 });
+}
+
+function renderObjectExpanded(memory) {
+  clearStage(); currentStage = 'objectExpanded'; setStatus(`${memory.title} · 3D`); makeBack();
+  if (jungfrauModel) {
+    const model = centeredScaledClone(jungfrauModel, .82); model.position.set(0,1.50,-1.92); stageRoot.add(model);
+    model.userData.dragRotate = true;
+    model.traverse(o => { if (o.isMesh) { o.userData.dragTarget = model; interactables.push(o); } });
+    animated.push({type:'rotateSlow', object:model});
+  } else makePlane({width:1.05,height:.78,position:[0,1.55,-2.05],texture:cacheTexture('./assets/images/jungfrau-reflection.png')});
+  makeTextPanel({ width:.65,height:.15,position:[0,1.02,-1.84],canvas:{width:900,height:210,title:'Drag on desktop to rotate · look + pinch to inspect in XR',titleSize:34,bg:'rgba(23,51,78,.58)',fg:'#fff'} });
+}
+
+function openNote(index) {
+  clearStage(); currentStage = 'noteDetail'; setStatus(`Comfort note ${index}`); makeBack();
+  makePlane({ width:1.12,height:.745,position:[0,1.55,-2.05],texture:cacheTexture(`./assets/images/note-${index}.png`) });
+}
+
+function renderVoiceIsle(showMessage = false) {
+  if (showMessage) voiceIntroUntil = performance.now() + INTRO_HOLD_MS + INTRO_FADE_MS;
+  clearStage();
+  currentStage = 'voice';
+  randomMode = false;
+  setIsleBackground('voice');
+  setStatus('Voice Isle');
+
+  VOICES.forEach((voice, i) => makeOrb(voice, VOICE_POSITIONS[i], i));
+
+  // Swift uses the exact same portal position and 0.78 scale in both islands.
+  makePortal('Heaven Isle', [0.00, 1.13, -1.05], () => renderHeaven(false), 0xffd6ad);
+  makeExit();
+  makeFixedControlButton(
+    'settings',
+    './assets/icons/icon_setting.svg',
+    [-0.86, 2.00, -0.92],
+    () => showToast('Settings are not connected in this web prototype yet.')
+  );
+
+  // Normal Mode / Surprise is intentionally absent on Voice Isle (Swift isEnabled: false).
+  const voiceIntroRemaining = voiceIntroUntil - performance.now();
+  if (voiceIntroRemaining > 0) {
+    makeTransientStageIntro(
+      'Voice Isle',
+      'Pinch a voice to listen',
+      [0, 1.63, -0.96],
+      voiceIntroRemaining
+    );
+  }
+}
+
+function openVoice(voice) { selectedVoice = voice; renderVoiceDetail(voice); }
+
+function renderVoiceDetail(voice) {
+  clearStage(); currentStage = 'voiceDetail'; setIsleBackground('voice'); setStatus(voice.title.replace('\n',' ')); makeBack();
+  makeTextPanel({ width:1.08,height:.72,position:[0,1.62,-2.05],canvas:{width:1100,height:760,title:voice.title,body:voice.description,titleSize:62,bodySize:31,bg:'rgba(244,250,255,.90)'} });
+  const audio = new Audio(voice.asset); activeMedia.add(audio);
+  let playing = false;
+  const button = makeButton('Play voice',[0,1.14,-1.90],async() => {
+    if (playing) { audio.pause(); playing=false; updateButtonLabel(button,'Play voice'); }
+    else { try { await audio.play(); playing=true; updateButtonLabel(button,'Pause'); } catch(e){ showToast('Audio playback needs another pinch/click.'); } }
+  },{width:.36});
+  audio.addEventListener('ended',()=>{playing=false; updateButtonLabel(button,'Play voice');});
+}
+
+function updateButtonLabel(button,label) {
+  button.material.map?.dispose?.();
+  button.material.map = makeButtonTexture(label, { bg: 'rgba(245,250,255,.90)', fg: '#1c334a' });
+  button.material.needsUpdate = true;
+}
+
+function openExitPrompt() {
+  stageBeforeExit = currentStage === 'voice' ? 'voice' : 'heaven';
+  clearStage(); currentStage='exitPrompt'; setStatus('Exit'); makeBack();
+  makeTextPanel({width:1.0,height:.58,position:[0,1.65,-2.0],canvas:{width:1100,height:630,title:'Before you go',body:'Would you like to take a short moment to reflect on how you feel now?',titleSize:66,bodySize:34,bg:'rgba(246,250,255,.91)'}});
+  makeButton('Reflect',[-.23,1.22,-1.87],renderReflectionComfort,{width:.34});
+  makeButton('Exit now',[.23,1.22,-1.87],endXRSession,{width:.34});
+}
+
+function renderReflectionComfort({ preserveSelection = false } = {}) {
+  clearStage(); currentStage='reflectionComfort'; if (!preserveSelection) reflectionComfort=null; setStatus('Reflection · comfort'); makeBack();
+  makeTextPanel({width:.92,height:.34,position:[0,1.98,-2.0],canvas:{width:1000,height:370,title:'What brought you comfort today?',titleSize:58,bg:'rgba(246,250,255,.90)'}});
+  const options=['A memory','A familiar voice','A small object'];
+  options.forEach((o,i)=>makeButton(o,[(i-1)*.39,1.52,-1.92],()=>{reflectionComfort=o;renderReflectionComfortSelected();},{width:.34,height:.14}));
+}
+function renderReflectionComfortSelected(){ renderReflectionComfort({ preserveSelection: true }); makeTextPanel({width:.5,height:.14,position:[0,1.25,-1.88],canvas:{width:700,height:200,title:`Selected: ${reflectionComfort}`,titleSize:38,bg:'rgba(41,78,112,.60)',fg:'#fff'}}); makeButton('Next',[0,1.05,-1.82],renderReflectionFeeling,{width:.28}); }
+
+function renderReflectionFeeling({ preserveSelection = false } = {}) {
+  clearStage(); currentStage='reflectionFeeling'; if (!preserveSelection) reflectionFeeling=null; setStatus('Reflection · feeling'); makeBack();
+  makeTextPanel({width:.82,height:.30,position:[0,1.98,-2.0],canvas:{width:950,height:350,title:'How do you feel now?',titleSize:62,bg:'rgba(246,250,255,.90)'}});
+  ['Calmer','Warmer','About the same'].forEach((o,i)=>makeButton(o,[(i-1)*.40,1.52,-1.92],()=>{reflectionFeeling=o;renderReflectionFeelingSelected();},{width:.35,height:.14}));
+}
+function renderReflectionFeelingSelected(){ renderReflectionFeeling({ preserveSelection: true }); makeTextPanel({width:.52,height:.14,position:[0,1.25,-1.88],canvas:{width:720,height:200,title:`Selected: ${reflectionFeeling}`,titleSize:38,bg:'rgba(41,78,112,.60)',fg:'#fff'}}); makeButton('Next',[0,1.05,-1.82],renderReflectionVoice,{width:.28}); }
+
+function renderReflectionVoice() {
+  clearStage(); currentStage='reflectionVoice'; setStatus('Reflection · voice note'); makeBack();
+  makeTextPanel({width:1.0,height:.58,position:[0,1.65,-2.0],canvas:{width:1100,height:650,title:'One last thought',body:'In the full app this step records a short voice reflection. For the web prototype, save a sample reflection to continue.',titleSize:60,bodySize:32,bg:'rgba(246,250,255,.91)'}});
+  makeButton('Save reflection',[0,1.18,-1.87],renderReflectionSaved,{width:.45});
+}
+function renderReflectionSaved() {
+  clearStage(); currentStage='reflectionSaved'; setStatus('Reflection saved');
+  makeTextPanel({width:.90,height:.52,position:[0,1.65,-2.0],canvas:{width:1000,height:600,title:'Reflection saved',body:'Take the comfort with you, then return gently to your day.',titleSize:64,bodySize:34,bg:'rgba(246,250,255,.91)'}});
+  makeButton('Finish Session',[0,1.20,-1.87],endXRSession,{width:.42});
+}
+
+function goBack() {
+  if (currentStage==='voiceDetail') return renderVoiceIsle(false);
+  if (currentStage==='photoCinema') return renderPhotoDetail(selectedMemory);
+  if (currentStage==='videoCinema') return renderVideoDetail(selectedMemory);
+  if (currentStage==='objectExpanded') return renderObjectDetail(selectedMemory);
+  if (['photoDetail','videoDetail','objectDetail','noteDetail'].includes(currentStage)) return renderHeaven(false);
+  if (currentStage==='exitPrompt') return stageBeforeExit==='voice'?renderVoiceIsle(false):renderHeaven(false);
+  if (currentStage==='reflectionComfort') return openExitPrompt();
+  if (currentStage==='reflectionFeeling') return renderReflectionComfort();
+  if (currentStage==='reflectionVoice') return renderReflectionFeeling();
+}
+
+function endXRSession() {
+  const s = renderer.xr.getSession();
+  if (s) s.end();
+  clearStage(); currentStage='sessionEnd'; setStatus('Session ended');
+  makeTextPanel({width:.85,height:.44,position:[0,1.62,-2.0],canvas:{width:950,height:520,title:'See you later',body:'Your island will be here when you need it.',titleSize:66,bodySize:34,bg:'rgba(246,250,255,.91)'}});
+  makeButton('Return to Isle',[0,1.18,-1.87],()=>renderHeaven(false),{width:.42});
+}
+
+function showToast(text) {
+  const toast = makeTextPanel({width:.85,height:.18,position:[0,1.06,-1.72],canvas:{width:1000,height:220,title:text,titleSize:34,bg:'rgba(26,54,82,.76)',fg:'#fff'}});
+  setTimeout(()=>stageRoot.remove(toast),2200);
+}
+
+function resolveAction(obj) {
+  let current = obj;
+  while (current) {
+    if (typeof current.userData?.action === 'function') return current.userData.action;
+    current = current.parent;
+  }
+  return null;
+}
+
+function resolveTutorialAction(hit) {
+  const regions = hit.object?.userData?.tutorialHits;
+  if (!Array.isArray(regions) || !hit.uv) return null;
+
+  // Plane UV origin is bottom-left; the tutorial canvas origin is top-left.
+  const px = hit.uv.x * TUTORIAL_FRAME_PX.width;
+  const py = (1 - hit.uv.y) * TUTORIAL_FRAME_PX.height;
+
+  const region = regions.find(r =>
+    px >= r.x && px <= r.x + r.w &&
+    py >= r.y && py <= r.y + r.h
+  );
+  return region?.action || null;
+}
+
+function pickWithRay(ray) {
+  raycaster.ray.copy(ray);
+  const hits = raycaster.intersectObjects(interactables, true);
+  for (const hit of hits) {
+    const tutorialAction = resolveTutorialAction(hit);
+    if (tutorialAction) { tutorialAction(); return true; }
+
+    const action = resolveAction(hit.object);
+    if (action) { action(); return true; }
+  }
+  return false;
+}
+
+function onPointerDown(event) {
+  if (renderer.xr.isPresenting) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer,camera);
+  pickWithRay(raycaster.ray);
+}
+renderer.domElement.addEventListener('click',onPointerDown);
+
+renderer.xr.addEventListener('sessionstart',() => {
+  // XR local-floor already provides the user's physical eye height.
+  stageRoot.position.y = 0;
+  controls.enabled=false; setStatus(`${statusEl.textContent} · XR`);
+  const session=renderer.xr.getSession();
+  session.addEventListener('select',onXRSelect);
+});
+renderer.xr.addEventListener('sessionend',()=>{
+  stageRoot.position.y = DESKTOP_STAGE_Y_OFFSET;
+  controls.enabled=true;
+});
+
+function onXRSelect(event) {
+  const ref = renderer.xr.getReferenceSpace();
+  if (!ref || !event.frame || !event.inputSource?.targetRaySpace) return;
+  const pose = event.frame.getPose(event.inputSource.targetRaySpace, ref);
+  if (!pose) return;
+  const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
+  const origin = new THREE.Vector3().setFromMatrixPosition(m);
+  const q = new THREE.Quaternion().setFromRotationMatrix(m);
+  const dir = new THREE.Vector3(0,0,-1).applyQuaternion(q).normalize();
+  pickWithRay(new THREE.Ray(origin,dir));
+}
+
+function loadImageElement(path) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = path;
+  });
+}
+
+async function preloadTutorialAssets() {
+  const files = [
+    ['tutorial-1', './assets/tutorial/tutorial-1.png'],
+    ['tutorial-2', './assets/tutorial/tutorial-2.png'],
+    ['tutorial-3', './assets/tutorial/tutorial-3.png'],
+    ['tutorial-4', './assets/tutorial/tutorial-4.png'],
+    ['gaze', './assets/icons/gaze.svg'],
+    ['pinch', './assets/icons/pinch.svg'],
+    ['zoom', './assets/icons/zoom.svg']
+  ];
+  const loaded = await Promise.all(files.map(async ([key, path]) => [key, await loadImageElement(path)]));
+  loaded.forEach(([key, img]) => tutorialAssets.set(key, img));
+}
+
+async function ensureFontsReady() {
+  if (!document.fonts) return;
+  try {
+    await Promise.all([
+      document.fonts.load('600 82px "Playfair Display"'),
+      document.fonts.load('700 50px "Playfair Display"'),
+      document.fonts.load('700 28px "Playfair Display"')
+    ]);
+  } catch (e) {
+    console.warn('Playfair Display did not finish loading; serif fallback will be used.', e);
+  }
+}
+
+async function loadWorld() {
+  try {
+    setIsleBackground('heaven');
+  } catch (e) { console.warn('Sky texture fallback', e); }
+
+  // Tutorial appears immediately after its fonts/images are ready; heavy USDZ models load in the background.
+  await Promise.all([ensureFontsReady(), preloadTutorialAssets()]);
+  loadingEl.classList.add('hidden');
+  renderTutorial();
+
+  const loadModel = async (path) => {
+    try { return await usdLoader.loadAsync(path); }
+    catch (error) { console.warn(`USD model failed: ${path}`, error); return null; }
+  };
+  Promise.all([
+    loadModel('./assets/models/island.usdz'),
+    loadModel('./assets/models/jungfrau.usdz')
+  ]).then(([island, jungfrau]) => {
+    islandModel = island;
+    jungfrauModel = jungfrau;
+    if (currentStage === 'heaven' && !randomMode) renderHeaven(false);
+  });
+}
+
+function centeredScaledClone(source, targetSize = 1) {
+  const clone = source.clone(true);
+  const box = new THREE.Box3().setFromObject(clone);
+  const size = box.getSize(new THREE.Vector3());
+  const max = Math.max(size.x, size.y, size.z) || 1;
+  const scale = targetSize / max;
+  clone.scale.multiplyScalar(scale);
+
+  const scaledBox = new THREE.Box3().setFromObject(clone);
+  const center = scaledBox.getCenter(new THREE.Vector3());
+  const group = new THREE.Group();
+  clone.position.sub(center);
+  group.add(clone);
+  return group;
+}
+
+function animateObjects(t) {
+  for (const a of animated) {
+    if (!a.object?.parent) continue;
+    if (a.type==='float') a.object.position.y = a.baseY + Math.sin(t*a.speed*2 + a.phase)*a.amp;
+    else if (a.type==='portalFloat') {
+      a.object.position.y = a.baseY + Math.sin(t * a.speed * 2 + a.phase) * a.amp;
+      const s = 1 + Math.sin(t * 0.55) * 0.012;
+      a.object.scale.setScalar(s);
+    }
+    else if (a.type==='pulse') { const s=1+Math.sin(t*a.speed*2+a.phase)*.025; a.object.scale.setScalar(s); }
+    else if (a.type==='rotateSlow') a.object.rotation.y += .0025;
+    else if (a.type === 'tutorialEnter') {
+      const p = Math.min(1, Math.max(0, (t - a.startedAt) / a.duration));
+      const eased = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+      const scale = 0.97 + 0.03 * eased;
+      a.object.scale.setScalar(scale);
+      a.mats.forEach(m => { m.opacity = eased; });
+    }
+    else if (a.type === 'stageIntro') {
+      const elapsed = t - a.startedAt;
+      if (elapsed <= a.hold) {
+        a.object.material.opacity = 1;
+      } else {
+        const p = Math.min(1, (elapsed - a.hold) / a.fade);
+        a.object.material.opacity = 1 - p;
+        if (p >= 1 && a.object.parent) a.object.parent.remove(a.object);
+      }
+    }
+  }
+}
+
+function onResize() {
+  camera.aspect=window.innerWidth/window.innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth,window.innerHeight);
+}
+window.addEventListener('resize',onResize);
+
+renderer.setAnimationLoop(() => {
+  const t=clock.getElapsedTime();
+  if (!renderer.xr.isPresenting) controls.update();
+  animateObjects(t);
+  renderer.render(scene,camera);
+});
+
+loadWorld();
