@@ -19,29 +19,60 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x92bde5);
 const camera = new THREE.PerspectiveCamera(58, window.innerWidth / window.innerHeight, 0.01, 100);
 camera.position.set(0, 0, 0.0);
+scene.add(camera);
 
+// Reuse the same OrbitControls behaviour that made the original Heaven Isle
+// panorama draggable. Horizontal orbit stays enabled on Heaven/Voice only;
+// polar angle is locked to 90° so the whole interface can never tilt vertically.
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, -1.10);
 controls.enableDamping = true;
 controls.dampingFactor = 0.06;
-controls.minDistance = 0.55;
-controls.maxDistance = 4.2;
-controls.maxPolarAngle = Math.PI * 0.82;
-// Keep the desktop prototype perfectly front-facing. Only individual island models tilt.
-controls.enableRotate = false;
 controls.enablePan = false;
 controls.enableZoom = false;
+controls.minPolarAngle = Math.PI / 2;
+controls.maxPolarAngle = Math.PI / 2;
+controls.enableRotate = false;
 controls.update();
+
+let orbitDragStartX = 0;
+let orbitDragStartY = 0;
+let orbitPointerDown = false;
+let suppressNextSceneClick = false;
+let objectDragState = null;
+let objectDragMoved = false;
+
+function resetDesktopOrbit() {
+  if (renderer.xr.isPresenting) return;
+  camera.position.set(0, 0, 0);
+  controls.target.set(0, 0, -1.10);
+  camera.up.set(0, 1, 0);
+  controls.update();
+}
+
+function setDesktopOrbitEnabled(enabled) {
+  if (renderer.xr.isPresenting) return;
+  controls.enabled = true;
+  controls.enableRotate = !!enabled;
+  controls.enablePan = false;
+  controls.enableZoom = false;
+  controls.minPolarAngle = Math.PI / 2;
+  controls.maxPolarAngle = Math.PI / 2;
+  renderer.domElement.style.cursor = enabled ? 'grab' : 'default';
+}
 
 const sessionInit = { optionalFeatures: ['local-floor', 'hand-tracking'] };
 const vrButton = VRButton.createButton(renderer, sessionInit);
+// Prevent the default "VR NOT SUPPORTED" badge from ever flashing on desktop.
+vrButton.style.display = 'none';
 document.body.appendChild(vrButton);
 if (navigator.xr?.isSessionSupported) {
   navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
-    if (!supported) vrButton.style.display = 'none';
-  }).catch(() => { vrButton.style.display = 'none'; });
-} else {
-  vrButton.style.display = 'none';
+    if (supported) {
+      document.body.classList.add('xr-supported');
+      vrButton.style.display = '';
+    }
+  }).catch(() => {});
 }
 
 const worldRoot = new THREE.Group();
@@ -69,12 +100,54 @@ const pointer = new THREE.Vector2();
 const interactables = [];
 const animated = [];
 
+// Swift uses inward-facing 360 spheres for both Heaven Isle and Voice Isle.
+// On desktop we rotate only this panorama, keeping all UI/spatial content front-facing.
+let panoramaSphere = null;
+let panoramaTexture = null;
+let panoramaBaseYaw = 0;
+let panoramaYaw = 0;
+let panoramaPitch = 0;
+
 // Stage intro captions follow the Swift Memory Catch timing: hold 2.2s, fade 0.4s.
 let heavenIntroUntil = 0;
 let voiceIntroUntil = 0;
 const INTRO_HOLD_MS = 2200;
 const INTRO_FADE_MS = 400;
 const activeMedia = new Set();
+
+let voiceAudioContext = null;
+const voiceAudioNodes = new WeakMap();
+
+function boostVoiceAudio(audio, gainValue = 1.6) {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+      audio.volume = 1;
+      return null;
+    }
+    if (!voiceAudioContext) voiceAudioContext = new AudioCtx();
+    if (voiceAudioNodes.has(audio)) return voiceAudioNodes.get(audio);
+
+    const source = voiceAudioContext.createMediaElementSource(audio);
+    const gain = voiceAudioContext.createGain();
+    gain.gain.value = gainValue;
+    source.connect(gain);
+    gain.connect(voiceAudioContext.destination);
+    const nodes = { source, gain };
+    voiceAudioNodes.set(audio, nodes);
+    return nodes;
+  } catch (e) {
+    // If Web Audio is unavailable/blocked, keep the element at maximum native volume.
+    audio.volume = 1;
+    return null;
+  }
+}
+
+async function resumeVoiceAudioContext() {
+  if (voiceAudioContext?.state === 'suspended') {
+    try { await voiceAudioContext.resume(); } catch (e) {}
+  }
+}
 const cachedTextures = new Map();
 const cachedUiImages = new Map();
 let islandModel = null;
@@ -138,11 +211,11 @@ const MEMORY = [
 ];
 
 const VOICES = [
-  { id: 2, title: 'Mum Singing\nin the Car', asset: './assets/audio/song.m4a', orbPx: 196, titlePx: 31, description: 'Mum used to sing this song in the car. She’s not exactly in tune, but she loves singing — and hearing it always makes me smile.' },
-  { id: 1, title: 'A Call with Dad', asset: './assets/audio/dad.m4a', orbPx: 248, titlePx: 34, description: 'When I was working far from home, Dad reminded me to eat properly and look after my health. Hearing his voice gave me strength.' },
-  { id: 4, title: 'Dad’s Promise\nto Mum', asset: './assets/audio/promise.m4a', orbPx: 130, titlePx: 22, description: 'Dad made this promise to Mum, and he actually kept it. Hearing it again makes me happy, knowing that he meant what he said.' },
-  { id: 5, title: 'Mum Singing\nHappy Birthday', asset: './assets/audio/birthday.mp3', orbPx: 141, titlePx: 26, description: 'Mum sang Happy Birthday to Dad while I was living far away. Next year, I want to celebrate his birthday with them in person.' },
-  { id: 3, title: 'Mum’s Scary\nStory', asset: './assets/audio/story.m4a', orbPx: 257, titlePx: 38, description: 'Mum told me a scary story so dramatically and hilariously that we ended up laughing the whole time.' }
+  { id: 2, title: 'Mum Singing\nin the Car', label: 'Mum', asset: './assets/audio/song.m4a', orbPx: 196, titlePx: 31, description: 'Mum used to sing this song in the car. She’s not exactly in tune, but she loves singing — and hearing it always makes me smile.' },
+  { id: 1, title: 'A Call with Dad', label: 'Home', asset: './assets/audio/dad.m4a', orbPx: 220, titlePx: 31, description: 'When I was working far from home, Dad reminded me to eat properly and look after my health. Hearing his voice gave me strength.' },
+  { id: 4, title: 'Dad’s Promise\nto Mum', label: 'Best friend', asset: './assets/audio/promise.m4a', orbPx: 130, titlePx: 22, description: 'Dad made this promise to Mum, and he actually kept it. Hearing it again makes me happy, knowing that he meant what he said.' },
+  { id: 5, title: 'Mum Singing\nHappy Birthday', label: 'Dad', asset: './assets/audio/birthday.mp3', orbPx: 220, titlePx: 32, labelWidthPx: 200, description: 'Mum sang Happy Birthday to Dad while I was living far away. Next year, I want to celebrate his birthday with them in person.' },
+  { id: 3, title: 'Mum’s Scary\nStory', label: 'At grandparents’ house', asset: './assets/audio/story.m4a', orbPx: 141, titlePx: 26, labelWidthPx: 300, description: 'Mum told me a scary story so dramatically and hilariously that we ended up laughing the whole time.' }
 ];
 
 const TUTORIAL_STEPS = [
@@ -235,13 +308,14 @@ const VOICE_POSITIONS = [
   [-0.58, 1.80, -1.10], // Mum Singing in the Car
   [-0.05, 1.96, -1.18], // A Call with Dad
   [ 0.54, 1.81, -1.08], // Dad's Promise to Mum
-  [ 0.37, 1.28, -1.05], // Mum Singing Happy Birthday
+  [ 0.37, 1.38, -1.05], // Mum Singing Happy Birthday
   [-0.36, 1.35, -1.05]  // Mum's Scary Story
 ];
 
 function setStatus(text) { statusEl.textContent = text; }
 
 function clearStage() {
+  renderer.domElement.style.cursor = 'default';
   if (tutorialTimer) { clearTimeout(tutorialTimer); tutorialTimer = null; }
   activeMedia.forEach(media => {
     try { media.pause?.(); } catch (_) {}
@@ -525,6 +599,276 @@ function roundedRectShape(width, height, radius) {
   return shape;
 }
 
+
+function makeRoundedTextureMesh(texture, width, height, radius, position, action = null) {
+  const shape = roundedRectShape(width, height, radius);
+  const geometry = new THREE.ShapeGeometry(shape, 24);
+  const pos = geometry.attributes.position;
+  const uv = geometry.attributes.uv;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    const y = pos.getY(i);
+    uv.setXY(i, x / width + 0.5, y / height + 0.5);
+  }
+  uv.needsUpdate = true;
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({
+      map: texture,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    })
+  );
+  mesh.position.set(...position);
+  if (action) {
+    mesh.userData.action = action;
+    interactables.push(mesh);
+  }
+  stageRoot.add(mesh);
+  return mesh;
+}
+
+function makeGlassMediaCard(texture, position, action = null) {
+  const group = new THREE.Group();
+  group.position.set(...position);
+  const width = 1.26;
+  const height = 0.92;
+  const radius = 0.075;
+
+  // Broad glow so the glass reads clearly against the panorama.
+  const haloShape = roundedRectShape(width * 1.055, height * 1.07, radius * 1.15);
+  const halo = new THREE.Mesh(
+    new THREE.ShapeGeometry(haloShape, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.12,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    })
+  );
+  halo.position.z = -0.010;
+  group.add(halo);
+
+  // Dark translucent frosted slab — intentionally stronger than the previous
+  // version so it is visibly different from the old white card.
+  const frameShape = roundedRectShape(width, height, radius);
+  const frame = new THREE.Mesh(
+    new THREE.ShapeGeometry(frameShape, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0x58626e,
+      transparent: true,
+      opacity: 0.42,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    })
+  );
+  frame.position.z = 0;
+  group.add(frame);
+
+  // White inner sheen.
+  const sheen = new THREE.Mesh(
+    new THREE.ShapeGeometry(frameShape, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.08,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    })
+  );
+  sheen.scale.set(0.985, 0.985, 1);
+  sheen.position.z = 0.002;
+  group.add(sheen);
+
+  // Inset media, matching the Figma 10px glass-frame padding.
+  const mediaW = width - 0.036;
+  const mediaH = height - 0.036;
+  const mediaShape = roundedRectShape(mediaW, mediaH, radius * 0.88);
+  const mediaGeo = new THREE.ShapeGeometry(mediaShape, 32);
+  const pos = mediaGeo.attributes.position;
+  const uv = mediaGeo.attributes.uv;
+  for (let i = 0; i < pos.count; i++) {
+    uv.setXY(i, pos.getX(i) / mediaW + 0.5, pos.getY(i) / mediaH + 0.5);
+  }
+  uv.needsUpdate = true;
+  const media = new THREE.Mesh(
+    mediaGeo,
+    new THREE.MeshBasicMaterial({
+      map: texture,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    })
+  );
+  media.position.z = 0.006;
+  if (action) {
+    media.userData.action = action;
+    frame.userData.action = action;
+    interactables.push(media, frame);
+  }
+  group.add(media);
+
+  const edge = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints(
+      frameShape.getPoints(64).map(pt => new THREE.Vector3(pt.x, pt.y, 0.010))
+    ),
+    new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.92 })
+  );
+  group.add(edge);
+
+  stageRoot.add(group);
+  return group;
+}
+
+function makeMemoryInfoTexture(memory, typeLabel) {
+  const c = document.createElement('canvas');
+  c.width = 1000;
+  c.height = 1240;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+
+  const left = 82;
+  const right = c.width - 82;
+
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = `700 96px ${FONT_SERIF}`;
+  const titleLines = wrapText(ctx, memory.title, right - left);
+  let y = 86;
+  for (const line of titleLines.slice(0, 2)) {
+    ctx.fillText(line, left, y);
+    y += 102;
+  }
+
+  y += 6;
+  ctx.font = `500 40px "Inter", ${FONT_SANS}`;
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  ctx.fillText(typeLabel, left, y);
+  y += 74;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(left, y);
+  ctx.lineTo(right, y);
+  ctx.stroke();
+  y += 52;
+
+  ctx.font = `500 48px "Inter", ${FONT_SANS}`;
+  ctx.fillStyle = '#ffffff';
+  const bodyLines = wrapText(ctx, memory.description, right - left);
+  for (const line of bodyLines.slice(0, 10)) {
+    ctx.fillText(line, left, y);
+    y += 72;
+  }
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function makeGlassInfoCard(memory, typeLabel, position) {
+  const group = new THREE.Group();
+  group.position.set(...position);
+  const width = 0.74;
+  const height = 0.92;
+  const radius = 0.075;
+
+  const haloShape = roundedRectShape(width * 1.035, height * 1.025, radius * 1.08);
+  const halo = new THREE.Mesh(
+    new THREE.ShapeGeometry(haloShape, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.055,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    })
+  );
+  halo.position.z = -0.006;
+  group.add(halo);
+
+  const shape = roundedRectShape(width, height, radius);
+  const panel = new THREE.Mesh(
+    new THREE.ShapeGeometry(shape, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0x202731,
+      transparent: true,
+      opacity: 0.62,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    })
+  );
+  group.add(panel);
+
+  // Subtle frosted-white veil over the dark glass.
+  const veil = new THREE.Mesh(
+    new THREE.ShapeGeometry(shape, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.055,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    })
+  );
+  veil.scale.set(0.985, 0.985, 1);
+  veil.position.z = 0.002;
+  group.add(veil);
+
+  const edge = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints(
+      shape.getPoints(64).map(pt => new THREE.Vector3(pt.x, pt.y, 0.006))
+    ),
+    new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.62 })
+  );
+  group.add(edge);
+
+  const text = new THREE.Mesh(
+    new THREE.PlaneGeometry(width * 0.91, height * 0.91),
+    new THREE.MeshBasicMaterial({
+      map: makeMemoryInfoTexture(memory, typeLabel),
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    })
+  );
+  text.position.z = 0.010;
+  group.add(text);
+
+  stageRoot.add(group);
+  return group;
+}
+
+function makeFullscreenTextLink(label, position, action) {
+  const c = document.createElement('canvas');
+  c.width = 1040;
+  c.height = 180;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff';
+  ctx.shadowColor = 'rgba(0,0,0,0.25)';
+  ctx.shadowBlur = 10;
+  ctx.font = `500 58px "Inter", ${FONT_SANS}`;
+  ctx.fillText(label, c.width / 2, c.height / 2);
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  const mesh = makePlane({ width: 0.54, height: 0.094, position, texture, action, opacity: 1 });
+  mesh.material.depthWrite = false;
+  return mesh;
+}
+
 function makeFixedControlButton(label, iconPath, position, action, {
   depth = 0.0052,
   paddingX = CONTROL_PAD_X_PX,
@@ -636,10 +980,16 @@ function makeFixedControlButton(label, iconPath, position, action, {
 }
 
 function makeButton(label, position, action, { width = 0.34, height = 0.12, bg = 'rgba(245,250,255,.90)', fg = '#1c334a' } = {}) {
-  return makePlane({
-    width, height, position, action,
-    texture: makeButtonTexture(label, { bg, fg })
-  });
+  const mesh = makeRoundedTextureMesh(
+    makeButtonTexture(label, { bg, fg }),
+    width,
+    height,
+    Math.min(width, height) * 0.48,
+    position,
+    action
+  );
+  mesh.renderOrder = 6;
+  return mesh;
 }
 
 function makeImageCard(memory, layout) {
@@ -691,13 +1041,46 @@ function makeImageCard(memory, layout) {
 
 function setIsleBackground(kind = 'heaven') {
   const path = kind === 'voice' ? './assets/images/island.jpg' : './assets/images/sky.jpg';
-  const texture = cacheTexture(path);
-  texture.mapping = THREE.EquirectangularReflectionMapping;
+
+  if (panoramaSphere?.parent) panoramaSphere.parent.remove(panoramaSphere);
+  panoramaSphere?.geometry?.dispose?.();
+  panoramaSphere?.material?.dispose?.();
+  panoramaTexture?.dispose?.();
+
+  // Clone the cached source so each isle has an independent draggable UV offset.
+  // The panorama itself moves; camera, controls, panels, orbs and portals remain front-facing.
+  const texture = cacheTexture(path).clone();
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.offset.set(0, 0);
   texture.needsUpdate = true;
-  scene.background = texture;
-  // Swift voice sky applies a subtle ~20% black tint; backgroundIntensity keeps UI unaffected.
-  scene.backgroundIntensity = kind === 'voice' ? 0.80 : 1.00;
-  scene.backgroundBlurriness = 0;
+  panoramaTexture = texture;
+
+  const radius = kind === 'voice' ? 19.8 : 20.0;
+  const material = new THREE.MeshBasicMaterial({
+    map: texture,
+    side: THREE.BackSide,
+    color: kind === 'voice' ? 0xcccccc : 0xffffff,
+    depthWrite: false,
+    depthTest: false,
+    toneMapped: false
+  });
+  panoramaSphere = new THREE.Mesh(
+    new THREE.SphereGeometry(radius, 96, 64),
+    material
+  );
+  panoramaSphere.renderOrder = -1000;
+  panoramaBaseYaw = kind === 'voice' ? -Math.PI / 2 : Math.PI;
+  panoramaYaw = 0;
+  panoramaPitch = 0;
+  panoramaSphere.rotation.order = 'YXZ';
+  panoramaSphere.rotation.set(0, panoramaBaseYaw, 0);
+  if (panoramaTexture) panoramaTexture.offset.set(0, 0);
+  resetDesktopOrbit();
+  worldRoot.add(panoramaSphere);
+
+  scene.background = new THREE.Color(kind === 'voice' ? 0x183d55 : 0x92bde5);
 }
 
 function makeStageIntroTexture(title, subtitle) {
@@ -753,22 +1136,25 @@ function makeTransientStageIntro(title, subtitle, position, remainingMs) {
   return intro;
 }
 
-function makeVoiceLabelTexture(text, fontPx) {
+function makeVoiceLabelTexture(text, fontPx, designWidthPx, designHeightPx) {
+  const scale = 3;
   const c = document.createElement('canvas');
-  c.width = 1000;
-  c.height = 360;
+  c.width = Math.max(2, Math.round(designWidthPx * scale));
+  c.height = Math.max(2, Math.round(designHeightPx * scale));
   const ctx = c.getContext('2d');
   ctx.clearRect(0, 0, c.width, c.height);
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillStyle = '#ffffff';
   ctx.shadowColor = 'rgba(0,0,0,0.28)';
-  ctx.shadowBlur = 18;
-  ctx.font = `700 ${Math.round(fontPx * 2.25)}px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+  ctx.shadowBlur = 8 * scale;
+  ctx.font = `700 ${fontPx * scale}px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+
   const lines = String(text).split('\n');
-  const lineHeight = Math.round(fontPx * 4.0 * 1.08);
+  const lineHeight = fontPx * 1.10 * scale;
   const startY = c.height / 2 - ((lines.length - 1) * lineHeight) / 2;
   lines.forEach((line, i) => ctx.fillText(line, c.width / 2, startY + i * lineHeight));
+
   const texture = new THREE.CanvasTexture(c);
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
@@ -776,17 +1162,110 @@ function makeVoiceLabelTexture(text, fontPx) {
   return texture;
 }
 
+
 function makeVideoPreviewTexture(path) {
   const key = `preview:${path}`;
   if (cachedTextures.has(key)) return cachedTextures.get(key);
-  const c = document.createElement('canvas'); c.width = 960; c.height = 720;
+
+  const c = document.createElement('canvas');
+  c.width = 960;
+  c.height = 720;
   const ctx = c.getContext('2d');
-  const g = ctx.createLinearGradient(0,0,960,720); g.addColorStop(0,'#c8ddf1'); g.addColorStop(1,'#8fb4d5');
-  ctx.fillStyle = g; ctx.fillRect(0,0,960,720);
-  ctx.fillStyle = 'rgba(255,255,255,.92)'; ctx.beginPath(); ctx.arc(480,360,88,0,Math.PI*2); ctx.fill();
-  ctx.fillStyle = '#456987'; ctx.beginPath(); ctx.moveTo(458,314); ctx.lineTo(458,406); ctx.lineTo(536,360); ctx.closePath(); ctx.fill();
-  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
-  cachedTextures.set(key, t); return t;
+
+  const drawFallback = () => {
+    const g = ctx.createLinearGradient(0, 0, c.width, c.height);
+    g.addColorStop(0, '#c8ddf1');
+    g.addColorStop(1, '#8fb4d5');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, c.width, c.height);
+  };
+
+  const drawPlayBadge = () => {
+    const r = 54;
+    ctx.save();
+    ctx.fillStyle = 'rgba(255,255,255,.90)';
+    ctx.beginPath();
+    ctx.arc(c.width / 2, c.height / 2, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#456987';
+    ctx.beginPath();
+    ctx.moveTo(c.width / 2 - 12, c.height / 2 - 23);
+    ctx.lineTo(c.width / 2 - 12, c.height / 2 + 23);
+    ctx.lineTo(c.width / 2 + 28, c.height / 2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  };
+
+  drawFallback();
+  drawPlayBadge();
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  cachedTextures.set(key, texture);
+
+  // Extract a real frame from the local MP4 and update this same texture.
+  // This keeps the home card synchronous while the thumbnail loads asynchronously.
+  const video = document.createElement('video');
+  video.src = path;
+  video.muted = true;
+  video.defaultMuted = true;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.crossOrigin = 'anonymous';
+  video.setAttribute('playsinline', '');
+  video.setAttribute('webkit-playsinline', '');
+
+  const drawVideoFrame = () => {
+    if (!video.videoWidth || !video.videoHeight) return;
+
+    const srcAspect = video.videoWidth / video.videoHeight;
+    const dstAspect = c.width / c.height;
+    let sx = 0, sy = 0, sw = video.videoWidth, sh = video.videoHeight;
+
+    // Cover-crop so portrait and landscape clips both fill the memory card cleanly.
+    if (srcAspect > dstAspect) {
+      sw = video.videoHeight * dstAspect;
+      sx = (video.videoWidth - sw) / 2;
+    } else {
+      sh = video.videoWidth / dstAspect;
+      sy = (video.videoHeight - sh) / 2;
+    }
+
+    ctx.clearRect(0, 0, c.width, c.height);
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, c.width, c.height);
+    // Slight dark veil keeps the white play badge visible over bright footage.
+    ctx.fillStyle = 'rgba(0,0,0,.06)';
+    ctx.fillRect(0, 0, c.width, c.height);
+    drawPlayBadge();
+    texture.needsUpdate = true;
+  };
+
+  video.addEventListener('loadedmetadata', () => {
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    const previewTime = duration > 0.5 ? Math.min(Math.max(duration * 0.12, 0.25), duration - 0.15) : 0;
+    try {
+      video.currentTime = previewTime;
+    } catch (_) {
+      drawVideoFrame();
+    }
+  }, { once: true });
+
+  video.addEventListener('seeked', drawVideoFrame, { once: true });
+  video.addEventListener('loadeddata', () => {
+    // Some browsers expose the first decoded frame before a seek completes.
+    if (video.currentTime === 0) drawVideoFrame();
+  }, { once: true });
+
+  video.addEventListener('error', () => {
+    // Keep the fallback instead of leaving a blank/black card.
+    texture.needsUpdate = true;
+  }, { once: true });
+
+  video.load();
+  return texture;
 }
 
 function makeOrb(voice, position, index) {
@@ -795,8 +1274,12 @@ function makeOrb(voice, position, index) {
   group.position.set(...position);
   const pxToM = 0.00110;
   const orbSize = voice.orbPx * pxToM;
-  const labelWidth = Math.max((voice.orbPx + 50) * pxToM, 230 * pxToM);
-  const labelHeight = 0.100;
+  const displayLabel = voice.label || voice.title;
+  const designLabelWidth = voice.labelWidthPx || Math.max(voice.orbPx + 50, 230);
+  const lineCount = String(displayLabel).split('\n').length;
+  const designLabelHeight = Math.max(voice.titlePx * 1.35 * lineCount, voice.titlePx * 1.45);
+  const labelWidth = designLabelWidth * pxToM;
+  const labelHeight = designLabelHeight * pxToM;
   const gap = 29 * pxToM;
 
   const orb = new THREE.Mesh(
@@ -814,7 +1297,7 @@ function makeOrb(voice, position, index) {
   const label = new THREE.Mesh(
     new THREE.PlaneGeometry(labelWidth, labelHeight),
     new THREE.MeshBasicMaterial({
-      map: makeVoiceLabelTexture(voice.title, voice.titlePx),
+      map: makeVoiceLabelTexture(displayLabel, voice.titlePx, designLabelWidth, designLabelHeight),
       transparent: true,
       side: THREE.DoubleSide,
       depthWrite: false
@@ -1198,6 +1681,8 @@ function renderHeaven(showMessage = false) {
   if (showMessage) heavenIntroUntil = performance.now() + INTRO_HOLD_MS + INTRO_FADE_MS;
   clearStage();
   currentStage = 'heaven';
+  resetDesktopOrbit();
+  setDesktopOrbitEnabled(true);
   randomMode = false;
   setIsleBackground('heaven');
   setStatus('Heaven Isle · Memory Catch');
@@ -1316,6 +1801,11 @@ function addIslandToStage() {
   }
 }
 
+function setCinemaBlackout(enabled) {
+  if (panoramaSphere) panoramaSphere.visible = !enabled;
+  scene.background = new THREE.Color(enabled ? 0x000000 : 0x92bde5);
+}
+
 function openMemory(memory) {
   selectedMemory = memory;
   if (memory.type === 'photo') renderPhotoDetail(memory);
@@ -1324,44 +1814,164 @@ function openMemory(memory) {
 }
 
 function renderPhotoDetail(memory) {
-  clearStage(); currentStage = 'photoDetail'; setStatus(memory.title); makeBack();
-  makePlane({ width:.90,height:.675,position:[-.42,1.60,-2.18],texture:cacheTexture(memory.asset) });
-  makeTextPanel({ width:.76,height:.72,position:[.48,1.57,-2.18],canvas:{width:950,height:900,title:memory.title,body:memory.description,titleSize:54,bodySize:29,bg:'rgba(248,251,255,.91)',align:'left'} });
-  makeButton('View Full Screen', [.46,1.10,-2.00], () => renderPhotoCinema(memory), { width:.48 });
+  clearStage();
+  currentStage = 'photoDetail';
+  resetDesktopOrbit();
+  setDesktopOrbitEnabled(false);
+  setStatus(memory.title);
+  makeBack();
+  setCinemaBlackout(false);
+
+  makeGlassMediaCard(cacheTexture(memory.asset), [-0.50, 1.60, -1.72], () => renderPhotoCinema(memory));
+  makeGlassInfoCard(memory, 'Photo memory', [0.59, 1.60, -1.72]);
+  makeFullscreenTextLink('View Full Screen', [-0.50, 1.055, -1.64], () => renderPhotoCinema(memory));
 }
 
 function renderPhotoCinema(memory) {
-  clearStage(); currentStage = 'photoCinema'; setStatus(`${memory.title} · Cinema`); makeBack();
-  const backdrop = new THREE.Mesh(new THREE.PlaneGeometry(2.5,1.45),new THREE.MeshBasicMaterial({color:0x050607,transparent:true,opacity:.96})); backdrop.position.set(0,1.55,-2.55); stageRoot.add(backdrop);
-  makePlane({ width:1.52,height:1.14,position:[0,1.57,-2.20],texture:cacheTexture(memory.asset) });
+  clearStage();
+  currentStage = 'photoCinema';
+  resetDesktopOrbit();
+  setDesktopOrbitEnabled(true);
+  setStatus(`${memory.title} · Cinema`);
+  makeBack();
+  setCinemaBlackout(true);
+
+  // Near-camera cinema layer: fills almost the entire browser height while
+  // preserving the original 4:3 photo aspect ratio. Back stays in front.
+  const backdrop = new THREE.Mesh(
+    new THREE.PlaneGeometry(2.18, 1.22),
+    new THREE.MeshBasicMaterial({ color: 0x030405, transparent: true, opacity: 0.98 })
+  );
+  backdrop.position.set(0, 1.60, -1.10);
+  stageRoot.add(backdrop);
+
+  makePlane({
+    width: 1.40,
+    height: 1.05,
+    position: [0, 1.60, -1.04],
+    texture: cacheTexture(memory.asset)
+  });
 }
 
 function createVideo(path, loop = true) {
   const video = document.createElement('video');
-  video.src = path; video.loop = loop; video.muted = false; video.playsInline = true; video.preload = 'metadata';
-  activeMedia.add(video); return video;
+  video.src = path;
+  video.loop = loop;
+  video.muted = false;
+  video.defaultMuted = false;
+  video.volume = 1;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.setAttribute('playsinline', '');
+  video.setAttribute('webkit-playsinline', '');
+  video.load();
+  activeMedia.add(video);
+  return video;
+}
+
+async function startVideoPlayback(video) {
+  try {
+    video.muted = false;
+    video.volume = 1;
+    await video.play();
+    return true;
+  } catch (_) {
+    // Some browsers can still block audio playback even when the screen was
+    // opened from a spatial click. Keep the visual playback working and let
+    // the next click on the video restore sound.
+    try {
+      video.muted = true;
+      await video.play();
+      showToast('Video is playing. Click once for sound.');
+      return true;
+    } catch (_) {
+      showToast('Click the video to play.');
+      return false;
+    }
+  }
+}
+
+function toggleVideoPlayback(video) {
+  if (video.muted) {
+    video.muted = false;
+    video.volume = 1;
+    if (video.paused) startVideoPlayback(video);
+    return;
+  }
+  if (video.paused) startVideoPlayback(video);
+  else video.pause();
 }
 
 function renderVideoDetail(memory) {
-  clearStage(); currentStage = 'videoDetail'; setStatus(memory.title); makeBack();
-  makePlane({ width:.90,height:.675,position:[-.42,1.60,-2.18],texture:makeVideoPreviewTexture(memory.asset) });
-  makeTextPanel({ width:.76,height:.72,position:[.48,1.57,-2.18],canvas:{width:950,height:900,title:memory.title,body:memory.description,titleSize:54,bodySize:29,bg:'rgba(248,251,255,.91)',align:'left'} });
-  makeButton('Play Full Screen', [.46,1.10,-2.00], () => renderVideoCinema(memory), { width:.48 });
+  clearStage();
+  currentStage = 'videoDetail';
+  resetDesktopOrbit();
+  setDesktopOrbitEnabled(false);
+  setStatus(memory.title);
+  makeBack();
+  setCinemaBlackout(false);
+
+  makeGlassMediaCard(makeVideoPreviewTexture(memory.asset), [-0.50, 1.60, -1.72], () => renderVideoCinema(memory));
+  makeGlassInfoCard(memory, 'Video memory', [0.59, 1.60, -1.72]);
+  makeFullscreenTextLink('View Full Screen', [-0.50, 1.055, -1.64], () => renderVideoCinema(memory));
 }
 
 function renderVideoCinema(memory) {
-  clearStage(); currentStage = 'videoCinema'; setStatus(`${memory.title} · Cinema`); makeBack();
+  clearStage();
+  currentStage = 'videoCinema';
+  resetDesktopOrbit();
+  setDesktopOrbitEnabled(true);
+  setStatus(`${memory.title} · Cinema`);
+  makeBack();
+  setCinemaBlackout(true);
+
   const video = createVideo(memory.asset);
-  const texture = new THREE.VideoTexture(video); texture.colorSpace = THREE.SRGBColorSpace;
-  const backdrop = new THREE.Mesh(new THREE.PlaneGeometry(2.6,1.5),new THREE.MeshBasicMaterial({color:0x050607})); backdrop.position.set(0,1.55,-2.55); stageRoot.add(backdrop);
-  makePlane({ width:1.58,height:.89,position:[0,1.57,-2.20],texture });
-  video.play().catch(() => showToast('Pinch/click the video once to start playback.'));
+  const texture = new THREE.VideoTexture(video);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  texture.generateMipmaps = false;
+
+  // Both source MP4s are 16:9 files containing portrait footage with baked-in
+  // black side bars. Crop those bars so the actual memory fills the screen height.
+  let cropX = 0.625;
+  if (memory.asset.includes('paris.mp4')) cropX = 0.392;
+  if (memory.asset.includes('parents.mp4')) cropX = 0.625;
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.repeat.set(cropX, 1);
+  texture.offset.set((1 - cropX) / 2, 0);
+  texture.needsUpdate = true;
+
+  const contentAspect = (16 / 9) * cropX;
+  const mediaHeight = 1.06;
+  const mediaWidth = mediaHeight * contentAspect;
+
+  const backdrop = new THREE.Mesh(
+    new THREE.PlaneGeometry(2.18, 1.22),
+    new THREE.MeshBasicMaterial({ color: 0x030405, transparent: true, opacity: 0.98 })
+  );
+  backdrop.position.set(0, 1.60, -1.10);
+  stageRoot.add(backdrop);
+
+  makePlane({
+    width: mediaWidth,
+    height: mediaHeight,
+    position: [0, 1.60, -1.04],
+    texture,
+    action: () => toggleVideoPlayback(video)
+  });
+
+  startVideoPlayback(video);
 }
 
 function renderObjectDetail(memory) {
-  clearStage(); currentStage = 'objectDetail'; setStatus(memory.title); makeBack();
+  clearStage(); currentStage = 'objectDetail';
+  resetDesktopOrbit();
+  setDesktopOrbitEnabled(false);
+  setStatus(memory.title); makeBack();
+  addObjectInspectLights([-0.44, 1.48, -2.20]);
   if (jungfrauModel) {
-    const model = centeredScaledClone(jungfrauModel, .48); model.position.set(-.44,1.48,-2.20); model.rotation.set(.08,-.25,0); stageRoot.add(model);
+    const model = centeredScaledClone(jungfrauModel, .48); model.position.set(-.44,1.48,-2.20); model.rotation.set(.08,-.25,0); brightenModelMaterials(model); stageRoot.add(model);
     model.traverse(o => { if (o.isMesh) { o.userData.action = () => renderObjectExpanded(memory); interactables.push(o); } });
   } else makePlane({width:.62,height:.46,position:[-.44,1.55,-2.15],texture:cacheTexture('./assets/images/jungfrau-reflection.png'),action:() => renderObjectExpanded(memory)});
   makeTextPanel({ width:.80,height:.72,position:[.46,1.57,-2.18],canvas:{width:950,height:900,title:memory.title,body:memory.description,titleSize:54,bodySize:29,bg:'rgba(248,251,255,.91)',align:'left'} });
@@ -1369,14 +1979,16 @@ function renderObjectDetail(memory) {
 }
 
 function renderObjectExpanded(memory) {
-  clearStage(); currentStage = 'objectExpanded'; setStatus(`${memory.title} · 3D`); makeBack();
+  clearStage(); currentStage = 'objectExpanded';
+  resetDesktopOrbit();
+  setDesktopOrbitEnabled(false);
+  setStatus(`${memory.title} · 3D`); makeBack();
+  addObjectInspectLights([0, 1.50, -1.92]);
   if (jungfrauModel) {
-    const model = centeredScaledClone(jungfrauModel, .82); model.position.set(0,1.50,-1.92); stageRoot.add(model);
+    const model = centeredScaledClone(jungfrauModel, .82); model.position.set(0,1.50,-1.92); model.rotation.set(.10, -.12, 0); brightenModelMaterials(model); stageRoot.add(model);
     model.userData.dragRotate = true;
     model.traverse(o => { if (o.isMesh) { o.userData.dragTarget = model; interactables.push(o); } });
-    animated.push({type:'rotateSlow', object:model});
   } else makePlane({width:1.05,height:.78,position:[0,1.55,-2.05],texture:cacheTexture('./assets/images/jungfrau-reflection.png')});
-  makeTextPanel({ width:.65,height:.15,position:[0,1.02,-1.84],canvas:{width:900,height:210,title:'Drag on desktop to rotate · look + pinch to inspect in XR',titleSize:34,bg:'rgba(23,51,78,.58)',fg:'#fff'} });
 }
 
 function openNote(index) {
@@ -1388,6 +2000,8 @@ function renderVoiceIsle(showMessage = false) {
   if (showMessage) voiceIntroUntil = performance.now() + INTRO_HOLD_MS + INTRO_FADE_MS;
   clearStage();
   currentStage = 'voice';
+  resetDesktopOrbit();
+  setDesktopOrbitEnabled(true);
   randomMode = false;
   setIsleBackground('voice');
   setStatus('Voice Isle');
@@ -1416,18 +2030,323 @@ function renderVoiceIsle(showMessage = false) {
   }
 }
 
+const VOICE_WAVEFORM_BARS = [
+  18, 28, 41, 57, 39, 62, 49, 36,
+  54, 44, 31, 59, 33, 28, 39, 36,
+  49, 31, 23, 33, 44, 31, 23, 39,
+  46, 33, 39, 28, 23, 44, 33, 28,
+  39, 36, 49, 31, 23, 33, 44, 31,
+  23, 39, 46, 33, 39, 28, 23, 44
+];
+
+function makeVoiceDetailOrbTexture() {
+  const size = 600;
+  const c = document.createElement('canvas');
+  c.width = size * 2;
+  c.height = size * 2;
+  const ctx = c.getContext('2d');
+  ctx.scale(2, 2);
+  ctx.clearRect(0, 0, size, size);
+
+  const cx = size / 2;
+  const cy = size / 2;
+  const r = 228.5;
+  const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+  g.addColorStop(0.00, 'rgba(251,243,234,1)');
+  g.addColorStop(0.25, 'rgba(141,225,255,1)');
+  g.addColorStop(0.50, 'rgba(173,218,240,1)');
+  g.addColorStop(1.00, 'rgba(173,194,240,0.05)');
+
+  ctx.save();
+  ctx.shadowColor = 'rgba(172,225,255,0.42)';
+  ctx.shadowBlur = 45;
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 228.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.50)';
+  ctx.lineWidth = 2.46;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 262.774 / 2, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.lineWidth = 1.64;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 344.891 / 2, 0, Math.PI * 2);
+  ctx.stroke();
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function formatVoiceRemaining(audio) {
+  const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+  if (!duration) return '--:--';
+  const remaining = Math.max(duration - (audio.currentTime || 0), 0);
+  const total = Math.max(Math.ceil(remaining), 0);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+function voiceProgress(audio) {
+  const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+  if (!duration) return 0;
+  return Math.min(Math.max((audio.currentTime || 0) / duration, 0), 1);
+}
+
+function makeVoicePlayerTexture(audio) {
+  const c = document.createElement('canvas');
+  c.width = 1240;
+  c.height = 180;
+  const ctx = c.getContext('2d');
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+
+  const layout = { buttonCenterPx: c.width / 2, buttonRadiusPx: 72 };
+
+  const draw = () => {
+    const progress = voiceProgress(audio);
+    ctx.clearRect(0, 0, c.width, c.height);
+
+    const by = 90;
+    const br = 72;
+    const midY = 90;
+    const barW = 7.7;
+    const gap = 7.6;
+    const buttonGap = 18;
+    const timeGap = 30;
+
+    ctx.font = fontString({ size: 52, weight: 700, family: 'sans' });
+    const timeText = formatVoiceRemaining(audio);
+    const timeSlotWidth = Math.max(
+      ctx.measureText('00:00').width,
+      ctx.measureText('--:--').width,
+      ctx.measureText(timeText).width
+    );
+    const waveformWidth = (VOICE_WAVEFORM_BARS.length - 1) * (barW + gap) + barW;
+    const totalWidth = br * 2 + buttonGap + waveformWidth + timeGap + timeSlotWidth;
+    const startX = (c.width - totalWidth) / 2;
+    const bx = startX + br;
+    const waveformX = startX + br * 2 + buttonGap;
+    const waveformEnd = waveformX + waveformWidth;
+    const timeX = waveformEnd + timeGap;
+    layout.buttonCenterPx = bx;
+    layout.buttonRadiusPx = br;
+
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(bx, by, br, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#111111';
+    if (audio.paused || audio.ended) {
+      ctx.beginPath();
+      ctx.moveTo(bx - 18, by - 28);
+      ctx.lineTo(bx + 30, by);
+      ctx.lineTo(bx - 18, by + 28);
+      ctx.closePath();
+      ctx.fill();
+    } else {
+      ctx.fillRect(bx - 23, by - 29, 17, 58);
+      ctx.fillRect(bx + 7, by - 29, 17, 58);
+    }
+
+    VOICE_WAVEFORM_BARS.forEach((h, index) => {
+      const threshold = index / Math.max(VOICE_WAVEFORM_BARS.length - 1, 1);
+      ctx.fillStyle = threshold <= progress ? '#ffffff' : 'rgba(255,255,255,0.50)';
+      const bh = h * 1.75;
+      const x = waveformX + index * (barW + gap);
+      const y = midY - bh / 2;
+      const r = barW / 2;
+      roundedRect(ctx, x, y, barW, bh, r);
+      ctx.fill();
+    });
+
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(timeText, timeX, midY + 1);
+
+    texture.needsUpdate = true;
+  };
+
+  draw();
+  return { texture, draw, layout, canvasWidth: c.width };
+}
+
+function makeVoiceDescriptionTexture(voice) {
+  // Figma 832:8809 is 1300px wide with 40px padding, 19px vertical gap,
+  // 38px Inter Bold title and 24px Inter Medium body. Render at 2x here.
+  const c = document.createElement('canvas');
+  c.width = 2600;
+  c.height = 408;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+
+  // Glass panel: 10% black, 0.5px white border, 20px radius, soft white halo.
+  ctx.save();
+  ctx.shadowColor = 'rgba(255,255,255,0.20)';
+  ctx.shadowBlur = 60;
+  ctx.fillStyle = 'rgba(0,0,0,0.10)';
+  roundedRect(ctx, 20, 20, c.width - 40, c.height - 40, 40);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.50)';
+  ctx.lineWidth = 2;
+  roundedRect(ctx, 20, 20, c.width - 40, c.height - 40, 40);
+  ctx.stroke();
+
+  const heading = voice.label || voice.title.replace(/\n/g, ' ');
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+
+  // 40px top padding at Figma size -> 80px on this 2x canvas.
+  const topPadding = 80;
+  const compactHeading = heading.length <= 4;
+  const titleSize = compactHeading ? 68 : 76;
+  const titleLineHeight = compactHeading ? 80 : 88;
+  const gap = 38; // 19px Figma gap at 2x.
+  const bodySize = 48;
+  const bodyLineHeight = 58;
+
+  ctx.font = fontString({ size: titleSize, weight: 700, family: 'sans' });
+  ctx.fillText(heading, c.width / 2, topPadding);
+
+  // Keep Figma-like side padding, but force a visually balanced two-line body.
+  ctx.font = fontString({ size: bodySize, weight: 500, family: 'sans' });
+  const bodyMaxWidth = c.width - 160; // 40px each side at 2x.
+  const words = String(voice.description).trim().split(/\s+/);
+  let bodyLines = [];
+  if (words.length > 3) {
+    let best = null;
+    for (let i = 1; i < words.length; i++) {
+      const a = words.slice(0, i).join(' ');
+      const b = words.slice(i).join(' ');
+      const wa = ctx.measureText(a).width;
+      const wb = ctx.measureText(b).width;
+      if (wa <= bodyMaxWidth && wb <= bodyMaxWidth) {
+        const score = Math.abs(wa - wb);
+        if (!best || score < best.score) best = { a, b, score };
+      }
+    }
+    if (best) bodyLines = [best.a, best.b];
+  }
+  if (!bodyLines.length) bodyLines = wrapText(ctx, voice.description, bodyMaxWidth).slice(0, 2);
+
+  const bodyY = topPadding + titleLineHeight + gap;
+  bodyLines.forEach((line, i) => {
+    ctx.fillText(line, c.width / 2, bodyY + i * bodyLineHeight);
+  });
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function makeVoiceDetailDimmer() {
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(3.0, 1.72),
+    new THREE.MeshBasicMaterial({
+      color: 0x000000,
+      transparent: true,
+      opacity: 0.20,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    })
+  );
+  mesh.position.set(0, 1.60, -1.38);
+  mesh.renderOrder = -1;
+  stageRoot.add(mesh);
+  return mesh;
+}
+
 function openVoice(voice) { selectedVoice = voice; renderVoiceDetail(voice); }
 
 function renderVoiceDetail(voice) {
-  clearStage(); currentStage = 'voiceDetail'; setIsleBackground('voice'); setStatus(voice.title.replace('\n',' ')); makeBack();
-  makeTextPanel({ width:1.08,height:.72,position:[0,1.62,-2.05],canvas:{width:1100,height:760,title:voice.title,body:voice.description,titleSize:62,bodySize:31,bg:'rgba(244,250,255,.90)'} });
-  const audio = new Audio(voice.asset); activeMedia.add(audio);
-  let playing = false;
-  const button = makeButton('Play voice',[0,1.14,-1.90],async() => {
-    if (playing) { audio.pause(); playing=false; updateButtonLabel(button,'Play voice'); }
-    else { try { await audio.play(); playing=true; updateButtonLabel(button,'Pause'); } catch(e){ showToast('Audio playback needs another pinch/click.'); } }
-  },{width:.36});
-  audio.addEventListener('ended',()=>{playing=false; updateButtonLabel(button,'Play voice');});
+  clearStage();
+  currentStage = 'voiceDetail';
+  resetDesktopOrbit();
+  setDesktopOrbitEnabled(false);
+  setIsleBackground('voice');
+  setStatus(voice.label || voice.title.replace('\n', ' '));
+  makeBack();
+
+  // Figma 832:8798 / Swift VoiceDetailOrb: 600×600 attachment visual.
+  makePlane({
+    width: 0.60,
+    height: 0.60,
+    position: [0, 1.72, -1.06],
+    texture: makeVoiceDetailOrbTexture(),
+    opacity: 1
+  });
+
+  const audio = new Audio(voice.asset);
+  audio.preload = 'metadata';
+  audio.volume = 1;
+  boostVoiceAudio(audio, 1.6);
+  activeMedia.add(audio);
+
+  const player = makeVoicePlayerTexture(audio);
+
+  const togglePlayback = async () => {
+    if (!audio.paused && !audio.ended) {
+      audio.pause();
+      player.draw();
+      return;
+    }
+    if (audio.ended || (Number.isFinite(audio.duration) && audio.currentTime >= audio.duration - 0.05)) {
+      audio.currentTime = 0;
+    }
+    try {
+      await resumeVoiceAudioContext();
+      await audio.play();
+      player.draw();
+    } catch (e) {
+      showToast('Audio playback needs another pinch/click.');
+    }
+  };
+
+  const playerPlane = makePlane({
+    width: 0.64,
+    height: 0.093,
+    position: [0, 1.405, -1.01],
+    texture: player.texture,
+    opacity: 1,
+    action: togglePlayback
+  });
+  playerPlane.material.depthWrite = false;
+  playerPlane.renderOrder = 20;
+
+  makePlane({
+    width: 1.30,
+    height: 0.204,
+    position: [0, 1.185, -1.02],
+    texture: makeVoiceDescriptionTexture(voice),
+    opacity: 1
+  });
+
+  audio.addEventListener('loadedmetadata', player.draw);
+  audio.addEventListener('durationchange', player.draw);
+  audio.addEventListener('play', player.draw);
+  audio.addEventListener('pause', player.draw);
+  audio.addEventListener('ended', player.draw);
+
+  animated.push({
+    type: 'voicePlayback',
+    object: playerPlane,
+    audio,
+    draw: player.draw,
+    lastDrawAt: -1
+  });
 }
 
 function updateButtonLabel(button,label) {
@@ -1436,38 +2355,623 @@ function updateButtonLabel(button,label) {
   button.material.needsUpdate = true;
 }
 
+
+function makeReflectionDimmer() {
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(3.25, 1.86),
+    new THREE.MeshBasicMaterial({
+      color: 0x000000,
+      transparent: true,
+      opacity: 0.20,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    })
+  );
+  mesh.position.set(0, 1.60, -1.24);
+  mesh.renderOrder = -20;
+  stageRoot.add(mesh);
+  return mesh;
+}
+
+const REFLECTION_MPP = 0.001;
+const REFLECTION_CENTER_Y = 1.60;
+const REFLECTION_PANEL_Z = -1.02;
+const REFLECTION_CONTENT_Z = -0.985;
+
+function reflectionPoint(widthPx, heightPx, xPx, yPx, z = REFLECTION_CONTENT_Z) {
+  return [
+    (xPx - widthPx / 2) * REFLECTION_MPP,
+    REFLECTION_CENTER_Y + (heightPx / 2 - yPx) * REFLECTION_MPP,
+    z
+  ];
+}
+
+function makeReflectionPanelTexture({
+  widthPx = 720,
+  heightPx = 460,
+  title = '',
+  subtitle = '',
+  titleSize = 50,
+  titleY = 68,
+  subtitleY = 147,
+  horizontalPadding = 60
+} = {}) {
+  const scale = 2;
+  const c = document.createElement('canvas');
+  c.width = widthPx * scale;
+  c.height = heightPx * scale;
+  const ctx = c.getContext('2d');
+  ctx.scale(scale, scale);
+  ctx.clearRect(0, 0, widthPx, heightPx);
+
+  // Figma: rgba(243,240,237,.6), 50px radius, soft white halo.
+  ctx.fillStyle = 'rgba(243,240,237,0.60)';
+  roundedRect(ctx, 0, 0, widthPx, heightPx, 50);
+  ctx.fill();
+
+  // Subtle inner sheen only; do not veil content placed in front of this plane.
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 1;
+  roundedRect(ctx, 1, 1, widthPx - 2, heightPx - 2, 49);
+  ctx.stroke();
+
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#000000';
+  ctx.font = fontString({ size: titleSize, weight: 700, family: 'serif' });
+  ctx.fillText(title, horizontalPadding, titleY);
+
+  if (subtitle) {
+    ctx.fillStyle = '#7A736C';
+    ctx.font = fontString({ size: 24, weight: 500, family: 'sans', italic: true });
+    const maxWidth = widthPx - horizontalPadding * 2;
+    const lines = String(subtitle).split('\n').flatMap(line => wrapText(ctx, line, maxWidth));
+    lines.forEach((line, i) => ctx.fillText(line, horizontalPadding, subtitleY + i * 33.6));
+  }
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function makeReflectionTextTexture(text, {
+  widthPx = 240,
+  heightPx = 40,
+  fontSize = 20,
+  weight = 700,
+  family = 'serif',
+  fg = '#000000',
+  align = 'center'
+} = {}) {
+  const scale = 2;
+  const c = document.createElement('canvas');
+  c.width = widthPx * scale;
+  c.height = heightPx * scale;
+  const ctx = c.getContext('2d');
+  ctx.scale(scale, scale);
+  ctx.clearRect(0, 0, widthPx, heightPx);
+  ctx.font = fontString({ size: fontSize, weight, family });
+  ctx.fillStyle = fg;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, align === 'center' ? widthPx / 2 : 0, heightPx / 2 + 1);
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function makeReflectionButtonTexture(label, { widthPx = 200, heightPx = 64, bg = '#F3F0ED', fg = '#7A736C' } = {}) {
+  const scale = 2;
+  const c = document.createElement('canvas');
+  c.width = widthPx * scale;
+  c.height = heightPx * scale;
+  const ctx = c.getContext('2d');
+  ctx.scale(scale, scale);
+  ctx.clearRect(0, 0, widthPx, heightPx);
+  ctx.fillStyle = bg;
+  roundedRect(ctx, 0, 0, widthPx, heightPx, heightPx / 2);
+  ctx.fill();
+  ctx.font = fontString({ size: 24, weight: 700, family: 'sans' });
+  ctx.fillStyle = fg;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, widthPx / 2, heightPx / 2 + 1);
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function makeReflectionButton(label, panelWidthPx, panelHeightPx, centerXPx, centerYPx, action, {
+  widthPx = 200,
+  heightPx = 64,
+  bg = '#F3F0ED',
+  fg = '#7A736C'
+} = {}) {
+  const mesh = makeRoundedTextureMesh(
+    makeReflectionButtonTexture(label, { widthPx, heightPx, bg, fg }),
+    widthPx * REFLECTION_MPP,
+    heightPx * REFLECTION_MPP,
+    (heightPx / 2) * REFLECTION_MPP,
+    reflectionPoint(panelWidthPx, panelHeightPx, centerXPx, centerYPx),
+    action
+  );
+  mesh.material.depthWrite = false;
+  mesh.material.toneMapped = false;
+  mesh.renderOrder = 12;
+  return mesh;
+}
+
+function makeReflectionPanel({ width, height, texture, position = [0,REFLECTION_CENTER_Y,REFLECTION_PANEL_Z] }) {
+  const mesh = makeRoundedTextureMesh(texture, width, height, Math.min(width, height) * 0.075, position);
+  mesh.material.depthWrite = false;
+  mesh.material.toneMapped = false;
+  mesh.renderOrder = -5;
+  return mesh;
+}
+
+function makeReflectionMemoryCard(choice, selected, position, action) {
+  const group = new THREE.Group();
+  group.position.set(...position);
+  group.renderOrder = 8;
+
+  const mediaW = 0.270;
+  const mediaH = 0.200;
+  const radius = 0.017;
+
+  if (selected) {
+    // Figma selected card: 5px orange stroke, translucent warm backing, 10px padding.
+    const outerW = 0.300;
+    const outerH = 0.230;
+    const frame = new THREE.Mesh(
+      new THREE.ShapeGeometry(roundedRectShape(outerW, outerH, 0.021), 24),
+      new THREE.MeshBasicMaterial({ color: 0xE8956A, transparent: true, opacity: 1, depthWrite: false, toneMapped: false })
+    );
+    group.add(frame);
+    const inner = new THREE.Mesh(
+      new THREE.ShapeGeometry(roundedRectShape(outerW - 0.010, outerH - 0.010, 0.019), 24),
+      new THREE.MeshBasicMaterial({ color: 0xF3F0ED, transparent: true, opacity: 0.64, depthWrite: false, toneMapped: false })
+    );
+    inner.position.z = 0.002;
+    group.add(inner);
+  }
+
+  let texture;
+  if (choice === 'boracay') texture = cacheTexture('./assets/images/boracay.jpg');
+  else if (choice === 'paris') texture = makeVideoPreviewTexture('./assets/video/paris.mp4');
+  else texture = cacheTexture('./assets/images/reflection-jungfrau.png');
+
+  const cardBg = new THREE.Mesh(
+    new THREE.ShapeGeometry(roundedRectShape(mediaW, mediaH, radius), 24),
+    new THREE.MeshBasicMaterial({
+      color: choice === 'keyring' ? 0xFFFFFF : 0xF3F0ED,
+      transparent: true,
+      opacity: choice === 'keyring' ? 0.96 : 1,
+      depthWrite: false,
+      toneMapped: false
+    })
+  );
+  cardBg.position.z = 0.004;
+  cardBg.userData.action = action;
+  interactables.push(cardBg);
+  group.add(cardBg);
+
+  const displayW = choice === 'keyring' ? 0.210 : mediaW;
+  const displayH = choice === 'keyring' ? 0.160 : mediaH;
+  const media = makeRoundedTextureMesh(texture, displayW, displayH, radius * 0.9, [0, choice === 'keyring' ? 0.008 : 0, 0.007], action);
+  stageRoot.remove(media);
+  media.material.toneMapped = false;
+  media.renderOrder = 9;
+  group.add(media);
+
+  // User requested no tiny labels under these thumbnails.
+  stageRoot.add(group);
+  return group;
+}
+
+function makeReflectionMoodCard(choice, selected, position, action) {
+  const configs = {
+    struggling: { title: 'Still struggling.', icon: './assets/icons/feeling-1.svg' },
+    better: { title: 'Feeling better.', icon: './assets/icons/feeling-2.svg' },
+    good: { title: 'Feeling good!', icon: './assets/icons/feeling-3.svg' }
+  };
+  const cfg = configs[choice];
+  const group = new THREE.Group();
+  group.position.set(...position);
+  group.renderOrder = 8;
+
+  const cardW = 0.234;
+  const cardH = 0.267;
+
+  if (selected) {
+    const frame = new THREE.Mesh(
+      new THREE.ShapeGeometry(roundedRectShape(cardW, cardH, 0.050), 28),
+      new THREE.MeshBasicMaterial({ color: 0xE8956A, transparent: true, opacity: 1, depthWrite: false, toneMapped: false })
+    );
+    group.add(frame);
+    const inner = new THREE.Mesh(
+      new THREE.ShapeGeometry(roundedRectShape(cardW - 0.010, cardH - 0.010, 0.047), 28),
+      new THREE.MeshBasicMaterial({ color: 0xFFFFFF, transparent: true, opacity: 0.40, depthWrite: false, toneMapped: false })
+    );
+    inner.position.z = 0.002;
+    group.add(inner);
+  }
+
+  const icon = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.125, 0.125),
+    new THREE.MeshBasicMaterial({
+      map: cacheTexture(cfg.icon),
+      transparent: true,
+      opacity: 1,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      toneMapped: false
+    })
+  );
+  // 40px top padding: icon centre = 40 + 62.5.
+  icon.position.set(0, cardH / 2 - 0.1025, 0.008);
+  icon.userData.action = action;
+  interactables.push(icon);
+  group.add(icon);
+
+  const label = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.220, 0.036),
+    new THREE.MeshBasicMaterial({
+      map: makeReflectionTextTexture(cfg.title, { widthPx: 220, heightPx: 36, fontSize: 20, weight: 700, family: 'serif', fg: '#000000' }),
+      transparent: true,
+      depthWrite: false,
+      toneMapped: false
+    })
+  );
+  label.position.set(0, cardH / 2 - 0.205, 0.009);
+  label.userData.action = action;
+  interactables.push(label);
+  group.add(label);
+
+  const hit = new THREE.Mesh(
+    new THREE.PlaneGeometry(cardW, cardH),
+    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, toneMapped: false })
+  );
+  hit.position.z = 0.012;
+  hit.userData.action = action;
+  interactables.push(hit);
+  group.add(hit);
+
+  stageRoot.add(group);
+  return group;
+}
+
+function makeReflectionMicTexture() {
+  const c = document.createElement('canvas');
+  c.width = 640;
+  c.height = 640;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  const g = ctx.createRadialGradient(320,320,20,320,320,255);
+  g.addColorStop(0, 'rgba(255,255,255,0.96)');
+  g.addColorStop(0.34, 'rgba(232,149,106,0.30)');
+  g.addColorStop(1, 'rgba(232,149,106,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(320,320,255,0,Math.PI*2); ctx.fill();
+
+  ctx.fillStyle = '#ffffff';
+  roundedRect(ctx, 286, 218, 68, 150, 34); ctx.fill();
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 16;
+  ctx.beginPath();
+  ctx.arc(320, 335, 115, 0.12*Math.PI, 0.88*Math.PI);
+  ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(320,448); ctx.lineTo(320,498); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(265,498); ctx.lineTo(375,498); ctx.stroke();
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function makeReflectionTimerTexture() {
+  const widthPx = 420;
+  const heightPx = 44;
+  const scale = 2;
+  const c = document.createElement('canvas');
+  c.width = widthPx * scale;
+  c.height = heightPx * scale;
+  const ctx = c.getContext('2d');
+  ctx.scale(scale, scale);
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  const draw = (seconds = 0) => {
+    ctx.clearRect(0, 0, widthPx, heightPx);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = fontString({ size: 24, weight: 700, family: 'sans' });
+    const mm = String(Math.floor(seconds / 60)).padStart(2,'0');
+    const ss = String(seconds % 60).padStart(2,'0');
+    ctx.fillText(`Recording · ${mm}:${ss}`, widthPx / 2, heightPx / 2 + 1);
+    texture.needsUpdate = true;
+  };
+  draw(0);
+  return { texture, draw, widthPx, heightPx };
+}
+
+function makeReflectionSavedTexture() {
+  const c = document.createElement('canvas');
+  c.width = 1440;
+  c.height = 1000;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  ctx.save();
+  ctx.shadowColor = 'rgba(255,255,255,0.20)';
+  ctx.shadowBlur = 25;
+  ctx.shadowOffsetY = 0;
+  ctx.fillStyle = 'rgba(243,240,237,0.60)';
+  roundedRect(ctx, 16, 16, c.width-32, c.height-32, 100); ctx.fill();
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(255,255,255,0.24)'; ctx.lineWidth = 2;
+  roundedRect(ctx, 16, 16, c.width-32, c.height-32, 100); ctx.stroke();
+
+  ctx.fillStyle = '#f3f0ed';
+  ctx.beginPath(); ctx.arc(190, 220, 90, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#7a736c'; ctx.lineWidth = 16; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(145,220); ctx.lineTo(180,255); ctx.lineTo(240,185); ctx.stroke();
+
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillStyle='#000'; ctx.font=fontString({size:100,weight:700,family:'serif'});
+  ctx.fillText('Reflection saved',120,355);
+  ctx.fillStyle='#7a736c'; ctx.font=fontString({size:48,weight:500,family:'sans',italic:true});
+  ctx.fillText('You can revisit it later in your mobile Journal.',120,500);
+
+  ctx.fillStyle='#f3f0ed'; roundedRect(ctx, 500, 700, 440, 130, 65); ctx.fill();
+  ctx.fillStyle='#7a736c'; ctx.font=fontString({size:46,weight:700,family:'sans'}); ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('Finish Session',720,765);
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function prepareReflectionStage(stageName) {
+  clearStage();
+  currentStage = stageName;
+  resetDesktopOrbit();
+  setDesktopOrbitEnabled(false);
+  setIsleBackground(stageBeforeExit === 'voice' ? 'voice' : 'heaven');
+  makeReflectionDimmer();
+  setStatus('Reflection');
+}
+
 function openExitPrompt() {
-  stageBeforeExit = currentStage === 'voice' ? 'voice' : 'heaven';
-  clearStage(); currentStage='exitPrompt'; setStatus('Exit'); makeBack();
-  makeTextPanel({width:1.0,height:.58,position:[0,1.65,-2.0],canvas:{width:1100,height:630,title:'Before you go',body:'Would you like to take a short moment to reflect on how you feel now?',titleSize:66,bodySize:34,bg:'rgba(246,250,255,.91)'}});
-  makeButton('Reflect',[-.23,1.22,-1.87],renderReflectionComfort,{width:.34});
-  makeButton('Exit now',[.23,1.22,-1.87],endXRSession,{width:.34});
+  if (currentStage === 'voice' || currentStage === 'heaven') stageBeforeExit = currentStage;
+  prepareReflectionStage('exitPrompt');
+  makeBack();
+
+  const W = 720, H = 406;
+  makeReflectionPanel({
+    width: W * REFLECTION_MPP,
+    height: H * REFLECTION_MPP,
+    texture: makeReflectionPanelTexture({
+      widthPx: W,
+      heightPx: H,
+      title: 'Ready to leave?',
+      subtitle: 'Save a short reflection before you finish,\nor leave without saving.',
+      titleY: 68,
+      subtitleY: 147,
+      horizontalPadding: 60
+    })
+  });
+
+  makeReflectionButton('Reflect', W, H, 270, 306, renderReflectionComfort, { widthPx: 170, heightPx: 64 });
+  makeReflectionButton('Exit now', W, H, 462, 306, () => renderHeaven(false), {
+    widthPx: 190,
+    heightPx: 64,
+    bg: 'rgba(255,255,255,0.20)',
+    fg: '#000000'
+  });
 }
 
 function renderReflectionComfort({ preserveSelection = false } = {}) {
-  clearStage(); currentStage='reflectionComfort'; if (!preserveSelection) reflectionComfort=null; setStatus('Reflection · comfort'); makeBack();
-  makeTextPanel({width:.92,height:.34,position:[0,1.98,-2.0],canvas:{width:1000,height:370,title:'What brought you comfort today?',titleSize:58,bg:'rgba(246,250,255,.90)'}});
-  const options=['A memory','A familiar voice','A small object'];
-  options.forEach((o,i)=>makeButton(o,[(i-1)*.39,1.52,-1.92],()=>{reflectionComfort=o;renderReflectionComfortSelected();},{width:.34,height:.14}));
+  if (!preserveSelection) reflectionComfort = null;
+  prepareReflectionStage('reflectionComfort');
+  makeBack();
+
+  const W = 1060;
+  const H = reflectionComfort ? 609 : 485;
+  makeReflectionPanel({
+    width: W * REFLECTION_MPP,
+    height: H * REFLECTION_MPP,
+    texture: makeReflectionPanelTexture({
+      widthPx: W,
+      heightPx: H,
+      title: 'What brought you comfort today?',
+      titleY: 68,
+      horizontalPadding: 60
+    })
+  });
+
+  // 68 top / 60 side padding; 60px content gap. Thumbnail labels intentionally omitted.
+  const choices = ['boracay', 'paris', 'keyring'];
+  const centersX = [205, 525, 845];
+  const cardCenterY = 302;
+  choices.forEach((choice, i) => {
+    makeReflectionMemoryCard(
+      choice,
+      reflectionComfort === choice,
+      reflectionPoint(W, H, centersX[i], cardCenterY),
+      () => { reflectionComfort = choice; renderReflectionComfort({ preserveSelection: true }); }
+    );
+  });
+
+  if (reflectionComfort) {
+    makeReflectionButton('Next', W, H, W / 2, 509, () => renderReflectionFeeling(), {
+      widthPx: 300,
+      heightPx: 64,
+      fg: '#7A736C'
+    });
+  }
 }
-function renderReflectionComfortSelected(){ renderReflectionComfort({ preserveSelection: true }); makeTextPanel({width:.5,height:.14,position:[0,1.25,-1.88],canvas:{width:700,height:200,title:`Selected: ${reflectionComfort}`,titleSize:38,bg:'rgba(41,78,112,.60)',fg:'#fff'}}); makeButton('Next',[0,1.05,-1.82],renderReflectionFeeling,{width:.28}); }
+
+function renderReflectionComfortSelected() {
+  renderReflectionComfort({ preserveSelection: true });
+}
 
 function renderReflectionFeeling({ preserveSelection = false } = {}) {
-  clearStage(); currentStage='reflectionFeeling'; if (!preserveSelection) reflectionFeeling=null; setStatus('Reflection · feeling'); makeBack();
-  makeTextPanel({width:.82,height:.30,position:[0,1.98,-2.0],canvas:{width:950,height:350,title:'How do you feel now?',titleSize:62,bg:'rgba(246,250,255,.90)'}});
-  ['Calmer','Warmer','About the same'].forEach((o,i)=>makeButton(o,[(i-1)*.40,1.52,-1.92],()=>{reflectionFeeling=o;renderReflectionFeelingSelected();},{width:.35,height:.14}));
+  if (!preserveSelection) reflectionFeeling = null;
+  prepareReflectionStage('reflectionFeeling');
+  makeBack();
+
+  const W = 942;
+  const H = reflectionFeeling ? 733 : 609;
+  makeReflectionPanel({
+    width: W * REFLECTION_MPP,
+    height: H * REFLECTION_MPP,
+    texture: makeReflectionPanelTexture({
+      widthPx: W,
+      heightPx: H,
+      title: 'How do you feel now?',
+      subtitle: 'Take a moment before you leave.\nChoose what feels closest.',
+      titleY: 68,
+      subtitleY: 147,
+      horizontalPadding: 60
+    })
+  });
+
+  const choices = ['struggling', 'better', 'good'];
+  const centersX = [177, 471, 765];
+  const cardCenterY = 407.5;
+  choices.forEach((choice, i) => {
+    makeReflectionMoodCard(
+      choice,
+      reflectionFeeling === choice,
+      reflectionPoint(W, H, centersX[i], cardCenterY),
+      () => { reflectionFeeling = choice; renderReflectionFeeling({ preserveSelection: true }); }
+    );
+  });
+
+  if (reflectionFeeling) {
+    makeReflectionButton('Next', W, H, W / 2, 633, renderReflectionVoice, {
+      widthPx: 200,
+      heightPx: 64,
+      fg: '#7A736C'
+    });
+  }
 }
-function renderReflectionFeelingSelected(){ renderReflectionFeeling({ preserveSelection: true }); makeTextPanel({width:.52,height:.14,position:[0,1.25,-1.88],canvas:{width:720,height:200,title:`Selected: ${reflectionFeeling}`,titleSize:38,bg:'rgba(41,78,112,.60)',fg:'#fff'}}); makeButton('Next',[0,1.05,-1.82],renderReflectionVoice,{width:.28}); }
+
+function renderReflectionFeelingSelected() {
+  renderReflectionFeeling({ preserveSelection: true });
+}
 
 function renderReflectionVoice() {
-  clearStage(); currentStage='reflectionVoice'; setStatus('Reflection · voice note'); makeBack();
-  makeTextPanel({width:1.0,height:.58,position:[0,1.65,-2.0],canvas:{width:1100,height:650,title:'One last thought',body:'In the full app this step records a short voice reflection. For the web prototype, save a sample reflection to continue.',titleSize:60,bodySize:32,bg:'rgba(246,250,255,.91)'}});
-  makeButton('Save reflection',[0,1.18,-1.87],renderReflectionSaved,{width:.45});
+  prepareReflectionStage('reflectionVoice');
+  makeBack();
+
+  const W = 720, H = 789;
+  makeReflectionPanel({
+    width: W * REFLECTION_MPP,
+    height: H * REFLECTION_MPP,
+    texture: makeReflectionPanelTexture({
+      widthPx: W,
+      heightPx: H,
+      title: 'Add a voice reflection',
+      subtitle: 'Take a moment to share whatever is on your mind. You can revisit your reflection and explore suggested activities later in the Isle app.',
+      titleY: 68,
+      subtitleY: 147,
+      horizontalPadding: 60
+    })
+  });
+
+  const mic = makePlane({
+    width: 0.228,
+    height: 0.228,
+    position: reflectionPoint(W, H, W / 2, 422),
+    texture: makeReflectionMicTexture(),
+    opacity: 1
+  });
+  mic.material.depthWrite = false;
+  mic.material.toneMapped = false;
+  mic.renderOrder = 8;
+  animated.push({ type: 'pulse', object: mic, speed: 0.55, phase: 0 });
+
+  const timer = makeReflectionTimerTexture();
+  const timerPlane = makePlane({
+    width: timer.widthPx * REFLECTION_MPP,
+    height: timer.heightPx * REFLECTION_MPP,
+    position: reflectionPoint(W, H, W / 2, 583),
+    texture: timer.texture,
+    opacity: 1
+  });
+  timerPlane.material.depthWrite = false;
+  timerPlane.material.toneMapped = false;
+  timerPlane.renderOrder = 8;
+  animated.push({ type: 'reflectionTimer', object: timerPlane, startedAt: clock.getElapsedTime(), lastSecond: -1, draw: timer.draw });
+
+  makeReflectionButton('Save', W, H, W / 2, 689, renderReflectionSaved, {
+    widthPx: 200,
+    heightPx: 64,
+    fg: '#7A736C'
+  });
 }
+
+function makeReflectionSavedPanelTexture(widthPx = 720, heightPx = 520) {
+  const scale = 2;
+  const c = document.createElement('canvas');
+  c.width = widthPx * scale;
+  c.height = heightPx * scale;
+  const ctx = c.getContext('2d');
+  ctx.scale(scale, scale);
+  ctx.clearRect(0, 0, widthPx, heightPx);
+  ctx.fillStyle = 'rgba(243,240,237,0.60)';
+  roundedRect(ctx, 0, 0, widthPx, heightPx, 50);
+  ctx.fill();
+
+  // 90px check chip, matching Figma C.4.
+  ctx.fillStyle = '#F3F0ED';
+  ctx.beginPath(); ctx.arc(105, 113, 45, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#8C8279';
+  ctx.lineWidth = 8;
+  ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(83,113); ctx.lineTo(101,131); ctx.lineTo(131,96); ctx.stroke();
+
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#000000';
+  ctx.font = fontString({ size: 50, weight: 700, family: 'serif' });
+  ctx.fillText('Reflection saved', 60, 190);
+  ctx.fillStyle = '#7A736C';
+  ctx.font = fontString({ size: 24, weight: 500, family: 'sans', italic: true });
+  ctx.fillText('You can revisit it later in your mobile Journal.', 60, 269);
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  texture.needsUpdate = true;
+  return texture;
+}
+
 function renderReflectionSaved() {
-  clearStage(); currentStage='reflectionSaved'; setStatus('Reflection saved');
-  makeTextPanel({width:.90,height:.52,position:[0,1.65,-2.0],canvas:{width:1000,height:600,title:'Reflection saved',body:'Take the comfort with you, then return gently to your day.',titleSize:64,bodySize:34,bg:'rgba(246,250,255,.91)'}});
-  makeButton('Finish Session',[0,1.20,-1.87],endXRSession,{width:.42});
+  prepareReflectionStage('reflectionSaved');
+  setStatus('Reflection saved');
+  const W = 720, H = 520;
+  makeReflectionPanel({
+    width: W * REFLECTION_MPP,
+    height: H * REFLECTION_MPP,
+    texture: makeReflectionSavedPanelTexture(W, H)
+  });
+  makeReflectionButton('Finish Session', W, H, W / 2, 407, () => renderHeaven(false), {
+    widthPx: 250,
+    heightPx: 64,
+    fg: '#7A736C'
+  });
 }
 
 function goBack() {
@@ -1478,8 +2982,8 @@ function goBack() {
   if (['photoDetail','videoDetail','objectDetail','noteDetail'].includes(currentStage)) return renderHeaven(false);
   if (currentStage==='exitPrompt') return stageBeforeExit==='voice'?renderVoiceIsle(false):renderHeaven(false);
   if (currentStage==='reflectionComfort') return openExitPrompt();
-  if (currentStage==='reflectionFeeling') return renderReflectionComfort();
-  if (currentStage==='reflectionVoice') return renderReflectionFeeling();
+  if (currentStage==='reflectionFeeling') return renderReflectionComfort({ preserveSelection: true });
+  if (currentStage==='reflectionVoice') return renderReflectionFeeling({ preserveSelection: true });
 }
 
 function endXRSession() {
@@ -1502,6 +3006,67 @@ function resolveAction(obj) {
     current = current.parent;
   }
   return null;
+}
+
+function findDragTarget(obj) {
+  let current = obj;
+  while (current) {
+    if (current.userData?.dragTarget) return current.userData.dragTarget;
+    if (current.userData?.dragRotate) return current;
+    current = current.parent;
+  }
+  return null;
+}
+
+function getDragTargetFromPointer(event) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObjects(interactables, true);
+  for (const hit of hits) {
+    const dragTarget = findDragTarget(hit.object);
+    if (dragTarget) return dragTarget;
+  }
+  return null;
+}
+
+function addObjectInspectLights(anchor = [0, 1.52, -1.92]) {
+  const group = new THREE.Group();
+
+  const hemi = new THREE.HemisphereLight(0xf7fbff, 0x6c7f96, 1.15);
+  group.add(hemi);
+
+  const key = new THREE.DirectionalLight(0xfff3e1, 1.75);
+  key.position.set(anchor[0] + 0.72, anchor[1] + 0.72, anchor[2] + 0.92);
+  key.target.position.set(anchor[0], anchor[1] + 0.06, anchor[2]);
+  group.add(key, key.target);
+
+  const fill = new THREE.DirectionalLight(0xe4eefc, 0.95);
+  fill.position.set(anchor[0] - 0.85, anchor[1] + 0.18, anchor[2] + 0.55);
+  fill.target.position.set(anchor[0], anchor[1], anchor[2]);
+  group.add(fill, fill.target);
+
+  const ambient = new THREE.AmbientLight(0xffffff, 0.26);
+  group.add(ambient);
+
+  stageRoot.add(group);
+  return group;
+}
+
+function brightenModelMaterials(root) {
+  root.traverse((obj) => {
+    if (!obj.isMesh) return;
+    const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+    materials.forEach((material) => {
+      if (!material) return;
+      if ('metalness' in material) material.metalness = Math.min(material.metalness ?? 0.5, 0.55);
+      if ('roughness' in material) material.roughness = Math.max(material.roughness ?? 0.35, 0.32);
+      if ('envMapIntensity' in material) material.envMapIntensity = Math.max(material.envMapIntensity || 1, 1.08);
+      if ('emissiveIntensity' in material) material.emissiveIntensity = 0;
+      material.needsUpdate = true;
+    });
+  });
 }
 
 function resolveTutorialAction(hit) {
@@ -1532,19 +3097,79 @@ function pickWithRay(ray) {
   return false;
 }
 
-function onPointerDown(event) {
-  if (renderer.xr.isPresenting) return;
+function onPointerClick(event) {
+  if (renderer.xr.isPresenting || suppressNextSceneClick) {
+    suppressNextSceneClick = false;
+    return;
+  }
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer,camera);
   pickWithRay(raycaster.ray);
 }
-renderer.domElement.addEventListener('click',onPointerDown);
+
+// Heaven/Voice use OrbitControls for 360 drag. Object inspection uses direct
+// drag-to-rotate on the model itself so the background stays still.
+renderer.domElement.addEventListener('pointerdown', (event) => {
+  if (event.pointerType === 'mouse' && event.button !== 0) return;
+
+  if (!renderer.xr.isPresenting && currentStage === 'objectExpanded') {
+    const dragTarget = getDragTargetFromPointer(event);
+    if (dragTarget) {
+      objectDragState = {
+        target: dragTarget,
+        startX: event.clientX,
+        startRotationY: dragTarget.rotation.y
+      };
+      objectDragMoved = false;
+      suppressNextSceneClick = false;
+      renderer.domElement.style.cursor = 'grabbing';
+      return;
+    }
+  }
+
+  if (event.pointerType !== 'mouse' || event.button !== 0) return;
+  orbitPointerDown = true;
+  orbitDragStartX = event.clientX;
+  orbitDragStartY = event.clientY;
+  suppressNextSceneClick = false;
+  if (controls.enableRotate) renderer.domElement.style.cursor = 'grabbing';
+});
+window.addEventListener('pointermove', (event) => {
+  if (objectDragState) {
+    const dx = event.clientX - objectDragState.startX;
+    objectDragState.target.rotation.y = objectDragState.startRotationY + dx * 0.012;
+    if (Math.abs(dx) > 2) {
+      objectDragMoved = true;
+      suppressNextSceneClick = true;
+    }
+    return;
+  }
+
+  if (!orbitPointerDown || event.pointerType !== 'mouse') return;
+  const dx = event.clientX - orbitDragStartX;
+  const dy = event.clientY - orbitDragStartY;
+  if (Math.hypot(dx, dy) > 5) suppressNextSceneClick = true;
+});
+window.addEventListener('pointerup', (event) => {
+  if (objectDragState) {
+    if (objectDragMoved) suppressNextSceneClick = true;
+    objectDragState = null;
+    renderer.domElement.style.cursor = controls.enableRotate ? 'grab' : 'default';
+    return;
+  }
+
+  if (event.pointerType !== 'mouse') return;
+  orbitPointerDown = false;
+  renderer.domElement.style.cursor = controls.enableRotate ? 'grab' : 'default';
+});
+renderer.domElement.addEventListener('click', onPointerClick);
 
 renderer.xr.addEventListener('sessionstart',() => {
   // XR local-floor already provides the user's physical eye height.
   stageRoot.position.y = 0;
+  resetDesktopOrbit();
   controls.enabled=false; setStatus(`${statusEl.textContent} · XR`);
   const session=renderer.xr.getSession();
   session.addEventListener('select',onXRSelect);
@@ -1552,6 +3177,8 @@ renderer.xr.addEventListener('sessionstart',() => {
 renderer.xr.addEventListener('sessionend',()=>{
   stageRoot.position.y = DESKTOP_STAGE_Y_OFFSET;
   controls.enabled=true;
+  resetDesktopOrbit();
+  setDesktopOrbitEnabled(currentStage === 'heaven' || currentStage === 'voice' || currentStage === 'photoCinema' || currentStage === 'videoCinema');
 });
 
 function onXRSelect(event) {
@@ -1653,6 +3280,19 @@ function animateObjects(t) {
     }
     else if (a.type==='pulse') { const s=1+Math.sin(t*a.speed*2+a.phase)*.025; a.object.scale.setScalar(s); }
     else if (a.type==='rotateSlow') a.object.rotation.y += .0025;
+    else if (a.type === 'voicePlayback') {
+      if (t - a.lastDrawAt >= 0.05) {
+        a.lastDrawAt = t;
+        a.draw();
+      }
+    }
+    else if (a.type === 'reflectionTimer') {
+      const elapsed = Math.max(0, Math.floor(t - a.startedAt));
+      if (elapsed !== a.lastSecond) {
+        a.lastSecond = elapsed;
+        a.draw(elapsed);
+      }
+    }
     else if (a.type === 'tutorialEnter') {
       const p = Math.min(1, Math.max(0, (t - a.startedAt) / a.duration));
       const eased = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;

@@ -49,3 +49,4 @@ body { background: radial-gradient(circle at 50% 20%, #d8edff 0%, #91bfe8 55%, #
   #hud { left: 12px; top: 12px; }
   .help { display: none; }
 }
+body:not(.xr-supported) #VRButton { display: none !important; }
